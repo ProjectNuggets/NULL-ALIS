@@ -406,6 +406,26 @@ pub const SessionManager = struct {
         user_visible: bool = true,
     };
 
+    /// Owned reply plus its lifecycle policy. Background and subagent callers
+    /// must use this form before they decide whether a reply may cross a
+    /// durable queue, cache, history, or task-ledger boundary.
+    pub const ProcessMessageResult = struct {
+        text: []const u8,
+        reply_data_policy: Agent.ReplyDataPolicy = .ordinary,
+
+        fn initFromTurnOutcome(allocator: Allocator, outcome: Agent.TurnOutcome) !ProcessMessageResult {
+            return .{
+                .text = try allocator.dupe(u8, outcome.text),
+                .reply_data_policy = outcome.reply_data_policy,
+            };
+        }
+
+        pub fn deinit(self: *ProcessMessageResult, allocator: Allocator) void {
+            deinitOwnedReply(allocator, self.text);
+            self.* = undefined;
+        }
+    };
+
     pub const OriginSnapshot = struct {
         channel: ?[]u8 = null,
         account_id: ?[]u8 = null,
@@ -1190,6 +1210,22 @@ pub const SessionManager = struct {
         conversation_context: ?ConversationContext,
         options: ProcessMessageOptions,
     ) ![]const u8 {
+        const result = try self.processMessageResultWithContext(
+            session_key,
+            content,
+            conversation_context,
+            options,
+        );
+        return result.text;
+    }
+
+    pub fn processMessageResultWithContext(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        conversation_context: ?ConversationContext,
+        options: ProcessMessageOptions,
+    ) !ProcessMessageResult {
         const total_start_ms = std.time.milliTimestamp();
         const session = try self.acquireSessionForTurn(session_key);
         defer self.releaseSessionRef(session);
@@ -1206,7 +1242,7 @@ pub const SessionManager = struct {
             } else {
                 const queue_registration = queueRegisterWaiter(session);
                 if (queue_registration.dropped_message) |drop_msg| {
-                    return try self.allocator.dupe(u8, stableDropMessageOrDefault(drop_msg));
+                    return .{ .text = try self.allocator.dupe(u8, stableDropMessageOrDefault(drop_msg)) };
                 }
                 waiter_registered = true;
                 waiter_sequence = queue_registration.sequence;
@@ -1222,7 +1258,7 @@ pub const SessionManager = struct {
 
         if (waiter_registered) {
             if (queueDropAfterAcquire(session, waiter_sequence)) |drop_msg| {
-                return try self.allocator.dupe(u8, stableDropMessageOrDefault(drop_msg));
+                return .{ .text = try self.allocator.dupe(u8, stableDropMessageOrDefault(drop_msg)) };
             }
         }
 
@@ -1287,7 +1323,7 @@ pub const SessionManager = struct {
 
         if (activationBlockedMessage(session, options.message_turn_context)) |blocked_msg| {
             session.last_active = std.time.timestamp();
-            return try self.allocator.dupe(u8, blocked_msg);
+            return .{ .text = try self.allocator.dupe(u8, blocked_msg) };
         }
 
         var effective_conversation_context = conversation_context;
@@ -1402,12 +1438,13 @@ pub const SessionManager = struct {
         // (caller frees with agent.allocator) is preserved; the outcome
         // itself is owned by the Session and freed on next turn or deinit.
         const outcome = try (&session.agent).turnOutcome(effective_content);
-        const reply_data_policy = outcome.reply_data_policy;
-        const response = session.agent.allocator.dupe(u8, outcome.text) catch |err| {
+        const result = ProcessMessageResult.initFromTurnOutcome(session.agent.allocator, outcome) catch |err| {
             var unclaimed = outcome;
             unclaimed.deinit(session.agent.allocator);
             return err;
         };
+        const response = result.text;
+        const reply_data_policy = result.reply_data_policy;
         replaceReplayOutcome(&session.last_turn_outcome, session.agent.allocator, outcome);
         const agent_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - agent_start_ms));
         session.turn_count += 1;
@@ -1473,7 +1510,7 @@ pub const SessionManager = struct {
             total_duration_ms,
         });
 
-        return response;
+        return result;
     }
 
     pub fn appendAssistantMessage(self: *SessionManager, session_key: []const u8, content: []const u8) !void {
@@ -2011,6 +2048,37 @@ test "owned session replies are cleared when their display lifetime ends" {
     clearOwnedReply(reply);
     for (forensic_view) |byte| try testing.expectEqual(@as(u8, 0), byte);
     allocator.free(reply);
+}
+
+test "structured session replies expose ordinary provenance without changing legacy ownership" {
+    var mock = MockProvider{ .response = "structured reply" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    var result = try sm.processMessageResultWithContext("user:structured", "hello", null, .{});
+    defer result.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("structured reply", result.text);
+    try testing.expectEqual(Agent.ReplyDataPolicy.ordinary, result.reply_data_policy);
+}
+
+test "structured session reply teardown clears display-only text" {
+    const sentinel = "minutes-structured-secret";
+    var storage: [128]u8 = undefined;
+    @memset(&storage, 0xaa);
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = fixed.allocator();
+    var outcome = Agent.TurnOutcome{
+        .text = try allocator.dupe(u8, sentinel),
+        .reply_data_policy = .minutes_display_only,
+    };
+    var result = try SessionManager.ProcessMessageResult.initFromTurnOutcome(allocator, outcome);
+    outcome.deinit(allocator);
+
+    try testing.expectEqual(Agent.ReplyDataPolicy.minutes_display_only, result.reply_data_policy);
+    result.deinit(allocator);
+    try testing.expect(std.mem.indexOf(u8, &storage, sentinel) == null);
 }
 
 test "Minutes authorization state is installed only for a registered foreground capability" {
