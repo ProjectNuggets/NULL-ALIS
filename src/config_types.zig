@@ -77,14 +77,10 @@ pub const DiagnosticsConfig = struct {
 };
 
 pub const AutonomyConfig = struct {
-    /// V1 default: `.full` — auto-approve tool calls within SecurityPolicy
-    /// bounds. Rationale: nullalis v1 is a single-user pod, the pod owner
-    /// IS the user, and the SecurityPolicy still blocks high-risk shell
-    /// commands (`rm`, `sudo`, etc. — see `high_risk_commands` in
-    /// security/policy.zig). Approval friction served multi-tenant shared
-    /// scenarios, not the v1 per-user-pod shape. A UI toggle to flip back
-    /// to `.supervised` is tracked for future work.
-    level: AutonomyLevel = .full,
+    /// Safe default: bounded local mutations auto-approve, while dangerous
+    /// or paid side effects still require confirmation. Users may explicitly
+    /// opt into `.full` through the product settings surface.
+    level: AutonomyLevel = .supervised,
     workspace_only: bool = true,
     /// 2026-05-24 (v1.14.20): metering moved to zaki-prod central meter
     /// (5-hour rolling + weekly windows aggregated across products). Runtime-
@@ -1615,6 +1611,8 @@ pub const HttpRequestConfig = struct {
     enabled: bool = true,
     max_response_size: u32 = 1_000_000,
     timeout_secs: u64 = 30,
+    /// Empty is fail-closed: http_request remains unavailable until an
+    /// operator configures at least one destination.
     allowed_domains: []const []const u8 = &.{},
 };
 

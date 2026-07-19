@@ -1645,6 +1645,11 @@ const UserContext = struct {
 
 const USER_CELL_STATE_DIR = ".nullalis";
 
+fn tenantAutonomyMigrationPayload(snapshot: *const user_settings.NormalizedTenantConfig) ?[]const u8 {
+    if (!snapshot.settings.legacy_full_autonomy_migrated) return null;
+    return snapshot.json;
+}
+
 const TenantRuntime = struct {
     const TENANT_SEED_SCHEMA_VERSION: []const u8 = "2026-03-18-v1";
 
@@ -1766,6 +1771,16 @@ const TenantRuntime = struct {
                         runtime.effective_config_hash = configHash(snapshot.json);
                         runtime.resolved_settings = snapshot.settings;
                         runtime.ignored_tenant_override_count = snapshot.ignored_override_count;
+                        if (tenantAutonomyMigrationPayload(&snapshot)) |migration_json| {
+                            if (state_mgr.?.putConfigJson(numeric_user_id, migration_json)) |_| {
+                                writeFile(user_ctx.config_path, migration_json) catch |err| {
+                                    log.warn("tenant autonomy migration mirror write failed user={s} path={s}: {}", .{ user_ctx.user_id, user_ctx.config_path, err });
+                                };
+                                log.info("tenant.autonomy.migrated user={s} from=legacy_full to=supervised", .{user_ctx.user_id});
+                            } else |err| {
+                                log.warn("tenant autonomy migration persistence failed user={s}: {}", .{ user_ctx.user_id, err });
+                            }
+                        }
                         runtime.config.parseJson(snapshot.json) catch |err| {
                             log.warn("tenant config parse failed for user {s}: {s}", .{ user_ctx.user_id, @errorName(err) });
                         };
@@ -34311,6 +34326,22 @@ test "tenant config normalization strips operator-owned runtime keys" {
     try std.testing.expect(std.mem.indexOf(u8, normalized.json, "\"agent\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, normalized.json, "\"memory\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, normalized.json, "\"product_settings\"") != null);
+}
+
+test "WP-SEC1: tenant runtime persists only legacy full autonomy migrations" {
+    const legacy = try user_settings.normalizeTenantConfigJson(
+        std.testing.allocator,
+        "{\"product_settings\":{\"assistant_mode\":\"balanced\",\"group_activation\":\"mention\",\"proactive_updates\":false,\"voice_replies\":false,\"session_timeout_minutes\":30,\"autonomy\":\"full\"}}",
+    );
+    defer std.testing.allocator.free(legacy.json);
+    try std.testing.expectEqualStrings(legacy.json, tenantAutonomyMigrationPayload(&legacy).?);
+
+    const acknowledged = try user_settings.normalizeTenantConfigJson(
+        std.testing.allocator,
+        "{\"product_settings\":{\"assistant_mode\":\"balanced\",\"group_activation\":\"mention\",\"proactive_updates\":false,\"voice_replies\":false,\"session_timeout_minutes\":30,\"autonomy\":\"full\",\"autonomy_full_acknowledged\":true}}",
+    );
+    defer std.testing.allocator.free(acknowledged.json);
+    try std.testing.expect(tenantAutonomyMigrationPayload(&acknowledged) == null);
 }
 
 test "percentDecodePathSegment: happy path colon" {

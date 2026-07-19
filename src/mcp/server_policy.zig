@@ -18,8 +18,7 @@ const std = @import("std");
 
 /// The curated safe subset. Selection rationale:
 ///   - read-only / introspection: bounded, no side effects, safe to expose.
-///   - web_search / web_fetch: outbound but read-only and rate-bounded;
-///     net_security egress filtering still applies at the tool layer.
+///   - web_search: bounded provider query; arbitrary URL fetch remains gated.
 ///   - memory read + non-destructive append (`memory_tool_names`): the
 ///     "composable brain over MCP" payload — exposed ONLY when `mcp serve`
 ///     has bound a memory backend (`shouldExpose`'s `memory_available`);
@@ -48,9 +47,9 @@ const safe_tool_names = [_][]const u8{
     // Filesystem — read only. file_read is path-sandboxed by the tool
     // itself (workspace_dir + allowed_paths); no write counterpart exposed.
     "file_read",
-    // Web — outbound but read-only; net_security egress filter still gates.
+    // Web search is provider-bounded. Arbitrary web_fetch URLs are excluded:
+    // URL query data can itself be an exfiltration side effect.
     "web_search",
-    "web_fetch",
 };
 
 /// Memory tools — read + non-destructive append. Exposed only when the
@@ -115,11 +114,10 @@ pub fn safeSubsetCount(memory_available: bool) usize {
 
 const testing = std.testing;
 
-test "server_policy: safe subset includes read-only compute, file, and web tools" {
+test "server_policy: safe subset includes bounded compute, file, and search tools" {
     try testing.expect(isSafeToExpose("calculator"));
     try testing.expect(isSafeToExpose("file_read"));
     try testing.expect(isSafeToExpose("web_search"));
-    try testing.expect(isSafeToExpose("web_fetch"));
 }
 
 test "server_policy: memory tools are exposed only when a backend is bound" {
@@ -149,6 +147,7 @@ test "server_policy: dangerous tools are excluded from the safe subset" {
     try testing.expect(!isSafeToExpose("message"));
     try testing.expect(!isSafeToExpose("delegate"));
     try testing.expect(!isSafeToExpose("spawn"));
+    try testing.expect(!isSafeToExpose("web_fetch"));
     try testing.expect(!isSafeToExpose("memory_forget"));
     try testing.expect(!isSafeToExpose("memory_archive"));
     try testing.expect(!isSafeToExpose("set_execution_mode"));

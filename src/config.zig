@@ -306,6 +306,11 @@ pub const Config = struct {
         switch (AppProfile.fromString(self.profile)) {
             .standard => {},
             .zaki_bot => {
+                // Production must never silently fall back to unsandboxed
+                // shell execution when the host sandbox backend is absent.
+                if (self.security.sandbox.enabled == null) {
+                    self.security.sandbox.enabled = true;
+                }
                 // Primary provider is Moonshot's native API; Kimi K2.6's
                 // bare model ID on Moonshot is `kimi-k2.6` (Together's ID
                 // `moonshotai/Kimi-K2.6` is used only on the Together
@@ -1161,6 +1166,7 @@ pub const Config = struct {
         InvalidZakiBotStateBackend,
         MissingPostgresConnectionString,
         InvalidPostgresConnectionString,
+        UnsafeZakiBotSandboxConfiguration,
     };
 
     pub fn validate(self: *const Config) ValidationError!void {
@@ -1226,6 +1232,12 @@ pub const Config = struct {
             if (isPlaceholderSecretValue(self.state.postgres.connection_string)) {
                 return ValidationError.InvalidPostgresConnectionString;
             }
+            if (self.security.sandbox.enabled == null or
+                !self.security.sandbox.enabled.? or
+                self.security.sandbox.fail_open_on_dev)
+            {
+                return ValidationError.UnsafeZakiBotSandboxConfiguration;
+            }
         }
     }
 
@@ -1284,6 +1296,10 @@ pub const Config = struct {
             ),
             ValidationError.InvalidPostgresConnectionString => std.debug.print(
                 "Config error: zaki_bot profile Postgres connection string is empty or uses a placeholder value.\n",
+                .{},
+            ),
+            ValidationError.UnsafeZakiBotSandboxConfiguration => std.debug.print(
+                "Config error: zaki_bot profile requires security.sandbox.enabled=true and fail_open_on_dev=false.\n",
                 .{},
             ),
         }
@@ -4559,6 +4575,9 @@ test "profile zaki_bot enables http request defaults" {
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("zaki_bot", cfg.profile);
     try std.testing.expect(cfg.http_request.enabled);
+    try std.testing.expect(cfg.autonomy.level == .supervised);
+    try std.testing.expectEqual(true, cfg.security.sandbox.enabled.?);
+    try std.testing.expect(!cfg.security.sandbox.fail_open_on_dev);
     try std.testing.expect(!cfg.browser.enabled);
     // Primary route: Moonshot native API with the bare `kimi-k2.6` ID.
     try std.testing.expectEqualStrings("moonshot", cfg.default_provider);
@@ -4631,7 +4650,41 @@ test "zaki_bot validation requires provider entry token and postgres" {
         try allocator.dupe(u8, "prod-internal-token-1234"),
         try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki"),
     );
+    cfg.security.sandbox.enabled = true;
 
+    try cfg.validate();
+}
+
+test "WP-SEC1: zaki_bot validation rejects disabled or fail-open sandbox" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .profile = "zaki_bot",
+        .default_provider = "together-ai",
+        .default_model = "moonshotai/Kimi-K2.6",
+    };
+    cfg.providers = &.{
+        .{ .name = "together-ai", .api_key = "together-valid-key", .base_url = "https://api.together.xyz/v1" },
+    };
+    cfg.state.backend = "postgres";
+    cfg.applySecretRuntimeOverrides(
+        try allocator.dupe(u8, "prod-internal-token-1234"),
+        try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki"),
+    );
+
+    cfg.security.sandbox.enabled = false;
+    try std.testing.expectError(Config.ValidationError.UnsafeZakiBotSandboxConfiguration, cfg.validate());
+
+    cfg.security.sandbox.enabled = true;
+    cfg.security.sandbox.fail_open_on_dev = true;
+    try std.testing.expectError(Config.ValidationError.UnsafeZakiBotSandboxConfiguration, cfg.validate());
+
+    cfg.security.sandbox.fail_open_on_dev = false;
     try cfg.validate();
 }
 
@@ -4827,6 +4880,7 @@ test "zaki_bot validation accepts present primary provider api key (moonshot)" {
         try allocator.dupe(u8, "prod-internal-token-1234"),
         try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki"),
     );
+    cfg.security.sandbox.enabled = true;
 
     try cfg.validate();
 }

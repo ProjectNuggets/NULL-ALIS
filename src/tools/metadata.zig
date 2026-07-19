@@ -20,10 +20,10 @@ pub const ToolFlags = packed struct {
     background_safe: bool = false,
     operator_only: bool = false,
     concurrency_safe: bool = false,
-    /// Narrow supervised-mode bypass for local, editable artifact writes.
-    /// `ToolMetadata.validate()` constrains this to low-risk, class-A,
-    /// non-operator mutating tools so it cannot silently broaden to shell,
-    /// integrations, sharing, or rendered file generation.
+    /// Narrow supervised-mode bypass for explicitly reviewed, bounded
+    /// mutations. `ToolMetadata.validate()` rejects high/critical-risk and
+    /// class-C tools so it cannot silently broaden to shell, network egress,
+    /// sharing, bulk deletion, or paid generation.
     supervised_auto_approve: bool = false,
     /// **D1.14** — opts a tool into the generalized
     /// `tools/result_cache.zig` cache. When true, the dispatcher
@@ -206,7 +206,7 @@ pub const ToolMetadata = struct {
             if (!self.flags.mutating or self.flags.read_only or self.flags.operator_only) {
                 return error.InvalidAutoApproveMetadata;
             }
-            if (self.risk_level != .low or self.cost_class != .a) {
+            if (self.risk_level == .high or self.risk_level == .critical or self.cost_class == .c) {
                 return error.InvalidAutoApproveMetadata;
             }
         }
@@ -336,28 +336,36 @@ test "ToolMetadata conservative default is mutating" {
     try std.testing.expectEqual(RiskLevel.high, m.risk_level);
 }
 
-test "ToolMetadata validates supervised auto-approve as low-risk class-a mutating only" {
-    const ok = ToolMetadata{
-        .name = "artifact_create",
-        .flags = .{ .mutating = true, .supervised_auto_approve = true },
-        .risk_level = .low,
-        .cost_class = .a,
-    };
-    try ok.validate();
-
-    const high_risk = ToolMetadata{
-        .name = "artifact_share",
+test "ToolMetadata validates supervised auto-approve as bounded mutating only" {
+    const medium_risk = ToolMetadata{
+        .name = "file_write",
         .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .medium,
+        .cost_class = .a,
+    };
+    try medium_risk.validate();
+
+    const medium_cost = ToolMetadata{
+        .name = "produce_document",
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
+        .risk_level = .low,
+        .cost_class = .b,
+    };
+    try medium_cost.validate();
+
+    const high_risk = ToolMetadata{
+        .name = "shell",
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
+        .risk_level = .high,
         .cost_class = .a,
     };
     try std.testing.expectError(error.InvalidAutoApproveMetadata, high_risk.validate());
 
     const expensive = ToolMetadata{
-        .name = "produce_document",
+        .name = "image_generate",
         .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
-        .cost_class = .b,
+        .cost_class = .c,
     };
     try std.testing.expectError(error.InvalidAutoApproveMetadata, expensive.validate());
 

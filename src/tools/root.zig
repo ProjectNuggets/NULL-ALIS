@@ -428,10 +428,12 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .cache_scope = .global,
     },
     .{
-        // External HTTP fetch with up to 1MB response — medium cost.
+        // Arbitrary external HTTPS fetch. Even though the local operation is
+        // read-like, the request itself can exfiltrate model-visible data in
+        // its URL, so supervised mode must approval-gate it as outbound egress.
         .name = web_fetch.WebFetchTool.tool_name,
-        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
-        .risk_level = .medium,
+        .flags = .{ .mutating = true, .concurrency_safe = true },
+        .risk_level = .high,
         .cost_class = .b,
     },
     .{
@@ -461,7 +463,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     // Together FLUX costs $0.003+ per call — expensive tier.
     .{
         .name = image_generate.ImageGenerateTool.tool_name,
-        .flags = .{ .concurrency_safe = true },
+        .flags = .{ .mutating = true, .concurrency_safe = true },
         .risk_level = .low,
         .cost_class = .c,
     },
@@ -471,7 +473,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     // timestamped filename). Medium cost — invokes an external binary.
     .{
         .name = produce_document.ProduceDocumentTool.tool_name,
-        .flags = .{ .mutating = true, .background_safe = true, .concurrency_safe = true },
+        .flags = .{ .mutating = true, .background_safe = true, .concurrency_safe = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .b,
     },
@@ -506,13 +508,13 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     },
     .{
         .name = file_write.FileWriteTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .medium,
         .cost_class = .a,
     },
     .{
         .name = file_edit.FileEditTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .medium,
         .cost_class = .a,
     },
@@ -522,13 +524,13 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // lines in place via Hashline anchors (drift-tolerant), writing the
         // file back — a mutating filesystem edit. Same posture as file_edit.
         .name = file_edit_hashed.FileEditHashedTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .medium,
         .cost_class = .a,
     },
     .{
         .name = file_append.FileAppendTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .medium,
         .cost_class = .a,
     },
@@ -543,13 +545,13 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     },
     .{
         .name = memory_store.MemoryStoreTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
     .{
         .name = memory_edit.MemoryEditTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -571,7 +573,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // Close-outs stay reversible — mirrors memory_forget's MU/low/a
         // (forget is the hard-delete sibling).
         .name = memory_archive.MemoryArchiveTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -582,7 +584,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // immortality guard releases it for edit/archive. One row
         // metadata write, bounded, reversible → MU/low/a.
         .name = memory_demote.MemoryDemoteTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -646,7 +648,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // one LLM call (~$0.0003 on Kimi K2.6 cheap path) plus N cosine
         // resolutions, capped at MAX_MENTIONS_PER_TURN=24.
         .name = wiki_link.WikiLinkTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .b,
     },
@@ -663,7 +665,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // but the tool as a whole mutates persisted lists). Per-session
         // scope; cost is local memory writes only.
         .name = todo.TodoTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -674,7 +676,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // write + 1 memory_event row. Risk low: bounded inputs +
         // dangling references are filtered at /brain/graph render time.
         .name = compose_memory.ComposeMemoryTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -1087,13 +1089,6 @@ fn isReadOnlyGitOperation(args: JsonObjectMap) bool {
         std.ascii.eqlIgnoreCase(op, "branch");
 }
 
-fn isReadOnlyHttpMethod(args: JsonObjectMap) bool {
-    const method = getString(args, "method") orelse "GET";
-    return std.ascii.eqlIgnoreCase(method, "GET") or
-        std.ascii.eqlIgnoreCase(method, "HEAD") or
-        std.ascii.eqlIgnoreCase(method, "OPTIONS");
-}
-
 fn isReadOnlySkillRegistryAction(args: JsonObjectMap) bool {
     const action = getString(args, "action") orelse "list";
     return std.ascii.eqlIgnoreCase(action, "list") or std.ascii.eqlIgnoreCase(action, "search");
@@ -1138,8 +1133,7 @@ pub fn canonicalMetadataForName(tool_name: []const u8) metadata.ToolMetadata {
 ///   1. Registry lookup (`defaultMetadataRegistry`).
 ///   2. Conservative fallback for unknown names.
 ///   3. Args-aware refinement via `refineMetadata` (downgrades known
-///      read-only dispatch arguments like `schedule.list`, `git status`,
-///      HTTP GET, etc.).
+///      read-only dispatch arguments like `schedule.list` and `git status`).
 ///
 /// Any runtime gate that classifies tools — agent preflight, `/permissions`
 /// reporting, SecurityPolicy.resolveApproval callers — must route through
@@ -1178,7 +1172,6 @@ pub fn refineMetadata(base: metadata.ToolMetadata, args: JsonObjectMap) metadata
         if (std.mem.eql(u8, base.name, composio.ComposioTool.tool_name)) break :blk isReadOnlyComposioCall(args);
         if (std.mem.eql(u8, base.name, openapi.OpenApiTool.tool_name)) break :blk isReadOnlyOpenApiCall(args);
         if (std.mem.eql(u8, base.name, git.GitTool.tool_name)) break :blk isReadOnlyGitOperation(args);
-        if (std.mem.eql(u8, base.name, http_request.HttpRequestTool.tool_name)) break :blk isReadOnlyHttpMethod(args);
         if (std.mem.eql(u8, base.name, skill_registry.SkillRegistryTool.tool_name)) break :blk isReadOnlySkillRegistryAction(args);
         if (std.mem.eql(u8, base.name, todo.TodoTool.tool_name)) break :blk isReadOnlyTodoAction(args);
         break :blk false;
@@ -1203,14 +1196,11 @@ pub fn refineMetadata(base: metadata.ToolMetadata, args: JsonObjectMap) metadata
     // covers composio list/get — per-tenant API key, so scope =
     // .tenant; catalog-style results, so 60s TTL is safe.
     //
-    // Other action-dependent tools (schedule list, git status, http
-    // GET, skill_registry list) intentionally do NOT opt in here:
+    // Other action-dependent tools (schedule list, git status,
+    // skill_registry list) intentionally do NOT opt in here:
     //   - schedule list: low-value cache; user expects to see fresh
     //     scheduled jobs after a write
     //   - git status: local + fast; no measurable cache win
-    //   - http GET: per-URL responses may include user-specific data;
-    //     blanket caching is risky (cache-key includes URL but not
-    //     auth headers a tenant might pass via args — over-cautious)
     //   - skill_registry list: local + fast; no measurable cache win
     if (std.mem.eql(u8, base.name, composio.ComposioTool.tool_name)) {
         refined.flags.cacheable = true;
@@ -1741,7 +1731,9 @@ pub fn allTools(
 
     if (opts.http_enabled) {
         const ht = try allocator.create(http_request.HttpRequestTool);
-        ht.* = .{};
+        ht.* = .{
+            .allowed_domains = if (opts.config) |cfg| cfg.http_request.allowed_domains else &.{},
+        };
         try list.append(allocator, ht.tool());
 
         const wft = try allocator.create(web_fetch.WebFetchTool);
@@ -3058,6 +3050,7 @@ pub fn subagentTools(
     workspace_dir: []const u8,
     opts: struct {
         http_enabled: bool = false,
+        http_allowed_domains: []const []const u8 = &.{},
         allowed_paths: []const []const u8 = &.{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
         // Phase 3 (Subagent Pass): tenant handles so the subagent's
@@ -3103,7 +3096,7 @@ pub fn subagentTools(
 
     if (opts.http_enabled) {
         const ht = try allocator.create(http_request.HttpRequestTool);
-        ht.* = .{};
+        ht.* = .{ .allowed_domains = opts.http_allowed_domains };
         try list.append(allocator, ht.tool());
     }
 
@@ -3543,6 +3536,31 @@ test "all tools includes extras when enabled" {
     //   in the MAIN profile when multiagent is on — Superpowers-gated at
     //   execute(), not at registration) = 59.
     try std.testing.expectEqual(@as(usize, 59), tools.len);
+}
+
+test "all tools wires configured http request allowlist" {
+    const Config = @import("../config.zig").Config;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.http_request.allowed_domains = &.{"api.example.com"};
+
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .config = &cfg,
+        .http_enabled = true,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    for (tools) |tool_entry| {
+        if (!std.mem.eql(u8, tool_entry.name(), http_request.HttpRequestTool.tool_name)) continue;
+        const request_tool: *http_request.HttpRequestTool = @ptrCast(@alignCast(tool_entry.ptr));
+        try std.testing.expectEqual(@as(usize, 1), request_tool.allowed_domains.len);
+        try std.testing.expectEqualStrings("api.example.com", request_tool.allowed_domains[0]);
+        return;
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "all tools excludes extras when disabled" {
@@ -4038,21 +4056,58 @@ test "defaultMetadataRegistry flags all validate" {
     }
 }
 
-test "defaultMetadataRegistry auto-approves only local editable artifact writes" {
-    const registry = defaultMetadataRegistry();
-    const create = metadata.lookupMetadata("artifact_create", registry) orelse return error.TestUnexpectedResult;
-    const update = metadata.lookupMetadata("artifact_update", registry) orelse return error.TestUnexpectedResult;
-    const share = metadata.lookupMetadata("artifact_share", registry) orelse return error.TestUnexpectedResult;
-    const produce = metadata.lookupMetadata("produce_document", registry) orelse return error.TestUnexpectedResult;
+test "defaultMetadataRegistry supervised auto-approve set is exact" {
+    const safe_mutating = [_][]const u8{
+        "memory_store",    "memory_edit",      "compose_memory", "wiki_link",
+        "memory_archive",  "memory_demote",    "todo",           "file_write",
+        "file_edit",       "file_edit_hashed", "file_append",    "produce_document",
+        "artifact_create", "artifact_update",
+    };
 
-    try std.testing.expect(create.flags.mutating);
-    try std.testing.expect(create.flags.supervised_auto_approve);
-    try std.testing.expect(update.flags.mutating);
-    try std.testing.expect(update.flags.supervised_auto_approve);
+    for (safe_mutating) |name| {
+        const entry = metadata.lookupMetadata(name, &DEFAULT_TOOL_METADATA) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(entry.flags.mutating);
+        try std.testing.expect(entry.flags.supervised_auto_approve);
+    }
 
-    try std.testing.expect(share.flags.mutating);
-    try std.testing.expect(!share.flags.supervised_auto_approve);
-    try std.testing.expect(!produce.flags.supervised_auto_approve);
+    var auto_approve_count: usize = 0;
+    for (DEFAULT_TOOL_METADATA) |entry| {
+        if (entry.flags.supervised_auto_approve) auto_approve_count += 1;
+    }
+    try std.testing.expectEqual(safe_mutating.len, auto_approve_count);
+
+    const gated = [_][]const u8{
+        "shell",            "http_request",   "message",       "pushover",
+        "git_operations",   "schedule",       "cron_add",      "cron_update",
+        "cron_remove",      "cron_run",       "memory_forget", "memory_purge_topic",
+        "memory_purge_pii", "artifact_share", "delegate",      "spawn",
+        "spawn_many",       "image_generate", "web_fetch",
+    };
+    for (gated) |name| {
+        const entry = metadata.lookupMetadata(name, &DEFAULT_TOOL_METADATA) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(!entry.flags.supervised_auto_approve);
+        try std.testing.expect(entry.flags.mutating);
+    }
+}
+
+test "WP-SEC1: web_fetch arbitrary egress requires supervised approval" {
+    const ApprovalPolicy = @import("../security/approval_modes.zig").ApprovalPolicy;
+    const entry = canonicalMetadataForName(web_fetch.WebFetchTool.tool_name);
+
+    try std.testing.expect(entry.flags.mutating);
+    try std.testing.expect(!entry.flags.read_only);
+    try std.testing.expect(!entry.flags.background_safe);
+    try std.testing.expectEqual(metadata.RiskLevel.high, entry.risk_level);
+    try std.testing.expectEqual(ApprovalPolicy.confirm_once, ApprovalPolicy.forTool(entry, .supervised));
+}
+
+test "defaultMetadataRegistry has no unclassified side-effecting tool" {
+    for (DEFAULT_TOOL_METADATA) |entry| {
+        if (!entry.flags.read_only and !entry.flags.mutating) {
+            std.debug.print("unclassified tool metadata: {s}\n", .{entry.name});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "defaultMetadataRegistry classifies known read-only tools" {
@@ -4060,8 +4115,7 @@ test "defaultMetadataRegistry classifies known read-only tools" {
     const read_only = [_][]const u8{
         "runtime_info", "file_read",       "image_info", "memory_recall",
         "memory_list",  "memory_timeline", "cron_list",  "cron_runs",
-        "task_list",    "task_get",        "web_fetch",  "web_search",
-        "screenshot",
+        "task_list",    "task_get",        "web_search", "screenshot",
     };
     for (read_only) |name| {
         const m = metadata.lookupMetadata(name, registry) orelse {
@@ -4081,12 +4135,12 @@ test "defaultMetadataRegistry classifies known mutating tools" {
     // tools still classify" test below.
     const registry = defaultMetadataRegistry();
     const mutating = [_][]const u8{
-        "shell",               "file_write",       "file_edit",    "file_append",
-        "git_operations",      "memory_store",     "memory_edit",  "memory_forget",
-        "schedule",            "message",          "pushover",     "cron_add",
-        "cron_remove",         "cron_update",      "cron_run",     "http_request",
-        "browser_new_session", "browser_navigate", "browser_exec", "browser_close_session",
-        "composio",            "skill_registry",   "task_stop",
+        "shell",                 "file_write",          "file_edit",        "file_append",
+        "git_operations",        "memory_store",        "memory_edit",      "memory_forget",
+        "schedule",              "message",             "pushover",         "cron_add",
+        "cron_remove",           "cron_update",         "cron_run",         "http_request",
+        "web_fetch",             "browser_new_session", "browser_navigate", "browser_exec",
+        "browser_close_session", "composio",            "skill_registry",   "task_stop",
     };
     for (mutating) |name| {
         const m = metadata.lookupMetadata(name, registry) orelse {
@@ -4120,10 +4174,10 @@ test "multiagent-gated tools (delegate, spawn) still classify as mutating + non-
 test "defaultMetadataRegistry only whitelists expected background_safe tools" {
     const registry = defaultMetadataRegistry();
     const background_safe_names = [_][]const u8{
-        "runtime_info",     "file_read",             "memory_recall",
-        "memory_list",      "memory_timeline",       "transcript_read",
-        "web_fetch",        "web_search",            "task_list",
-        "task_get",         "set_execution_mode",    "context_snapshot",
+        "runtime_info",          "file_read",        "memory_recall",
+        "memory_list",           "memory_timeline",  "transcript_read",
+        "web_search",            "task_list",        "task_get",
+        "set_execution_mode",    "context_snapshot",
         // produce_document: writes ONLY to <workspace>/attachments/produced/
         // with timestamped filenames (no overwrite, no cross-invocation
         // state). Safe to run from a scheduled job / cron lane. Wave 2A.
@@ -4138,17 +4192,17 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // history tools. Same posture as get + list: safe to run from
         // a cron summary job. The mutating share + revoke_share
         // variants are explicitly NOT here.
-        "artifact_diff",    "artifact_history",
+           "artifact_diff",
+        "artifact_history",
         // 2026-05-25 surface-audit close — memory_doctor + trace_query
         // are pure in-process diagnostics. Memory doctor inspects RAM
         // counters + capabilities; trace_query reads a bounded RAM
         // store. Both are safe to run from a scheduled lane.
-             "memory_doctor",
-        "trace_query",
+             "memory_doctor",    "trace_query",
         // Phase 4 fan-out — subagent_batch_result reads a batch's task results
         // (read_only against the in-memory batch tracker); safe in a background/
         // cron lane. spawn_many is NOT here (it mutates — spawns subagents).
-             "subagent_batch_result",
+        "subagent_batch_result",
         // Pkg3 Task 5 — calculator is pure in-process compute;
         // file_read_hashed reads a workspace file (same background posture
         // as its sibling file_read). Both safe from a scheduled/cron lane.
@@ -4156,8 +4210,7 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // fix): they are read_only + concurrency_safe WITHOUT
         // background_safe — the locked design said "read_only" and their
         // pre-task empty flags never admitted them to this lane.
-        "calculator",
-        "file_read_hashed",
+        "calculator",       "file_read_hashed",
     };
 
     // Everything in the whitelist must be background_safe.
@@ -4252,35 +4305,26 @@ test "refineMetadata keeps git commit/add/checkout/stash mutating" {
     }
 }
 
-test "refineMetadata downgrades HTTP GET/HEAD/OPTIONS" {
+test "refineMetadata keeps every arbitrary HTTP request mutating" {
     const registry = defaultMetadataRegistry();
     const base = metadata.lookupMetadata("http_request", registry).?;
 
-    const safe_methods = [_][]const u8{ "GET", "get", "HEAD", "OPTIONS" };
-    for (safe_methods) |method| {
+    const methods = [_][]const u8{ "GET", "get", "HEAD", "OPTIONS", "POST", "PUT", "DELETE", "PATCH" };
+    for (methods) |method| {
         const buf = try std.fmt.allocPrint(std.testing.allocator, "{{\"url\":\"https://x\",\"method\":\"{s}\"}}", .{method});
         defer std.testing.allocator.free(buf);
         const parsed = try parseTestArgs(buf);
         defer parsed.deinit();
-        try std.testing.expect(refineMetadata(base, parsed.value.object).flags.read_only);
+        const refined = refineMetadata(base, parsed.value.object);
+        try std.testing.expect(refined.flags.mutating);
+        try std.testing.expect(!refined.flags.read_only);
     }
 
     const default_parsed = try parseTestArgs("{\"url\":\"https://x\"}");
     defer default_parsed.deinit();
-    try std.testing.expect(refineMetadata(base, default_parsed.value.object).flags.read_only);
-}
-
-test "refineMetadata keeps HTTP POST/PUT/DELETE/PATCH mutating" {
-    const registry = defaultMetadataRegistry();
-    const base = metadata.lookupMetadata("http_request", registry).?;
-    const mutating_methods = [_][]const u8{ "POST", "PUT", "DELETE", "PATCH" };
-    for (mutating_methods) |method| {
-        const buf = try std.fmt.allocPrint(std.testing.allocator, "{{\"url\":\"https://x\",\"method\":\"{s}\"}}", .{method});
-        defer std.testing.allocator.free(buf);
-        const parsed = try parseTestArgs(buf);
-        defer parsed.deinit();
-        try std.testing.expect(refineMetadata(base, parsed.value.object).flags.mutating);
-    }
+    const default_refined = refineMetadata(base, default_parsed.value.object);
+    try std.testing.expect(default_refined.flags.mutating);
+    try std.testing.expect(!default_refined.flags.read_only);
 }
 
 test "refineMetadata downgrades composio list/get and read-only execute" {
@@ -4482,7 +4526,7 @@ test "metadata_completeness_pkg3: previously-unregistered + empty-flag tools cla
     try std.testing.expect(!bg.flags.background_safe);
 }
 
-test "canonicalMetadataForCall applies args-aware refinement (schedule.list, git status, GET)" {
+test "canonicalMetadataForCall refines bounded local reads but keeps arbitrary HTTP dangerous" {
     const allocator = std.testing.allocator;
 
     const sched = canonicalMetadataForCall(allocator, "schedule", "{\"action\":\"list\"}");
@@ -4496,11 +4540,13 @@ test "canonicalMetadataForCall applies args-aware refinement (schedule.list, git
     try std.testing.expect(git_write.flags.mutating);
     try std.testing.expect(!git_write.flags.read_only);
 
-    const http_get = canonicalMetadataForCall(allocator, "http_request", "{\"method\":\"GET\"}");
-    try std.testing.expect(http_get.flags.read_only);
-
-    const http_post = canonicalMetadataForCall(allocator, "http_request", "{\"method\":\"POST\"}");
-    try std.testing.expect(http_post.flags.mutating);
+    inline for (.{ "GET", "HEAD", "OPTIONS", "POST" }) |method| {
+        const args = std.fmt.comptimePrint("{{\"method\":\"{s}\"}}", .{method});
+        const http_call = canonicalMetadataForCall(allocator, "http_request", args);
+        try std.testing.expect(http_call.flags.mutating);
+        try std.testing.expect(!http_call.flags.read_only);
+        try std.testing.expectEqual(metadata.RiskLevel.high, http_call.risk_level);
+    }
 }
 
 test "canonicalMetadataForCall falls back to base metadata on invalid JSON" {
