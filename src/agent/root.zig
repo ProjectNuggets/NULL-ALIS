@@ -2207,8 +2207,19 @@ pub const Agent = struct {
     fn minutesReadStateEligible(self: *const Agent) bool {
         if (!self.hasMinutesReadTool()) return false;
         const turn_context = tools_mod.getTurnContext();
-        if (tools_mod.isBackgroundTurnOrigin(turn_context.origin)) return false;
+        if (tools_mod.isBackgroundTurnOrigin(turn_context.origin)) {
+            return tools_mod.isMinutesBackgroundReadAuthorized(turn_context);
+        }
         return turn_context.minutes_read_state != null;
+    }
+
+    fn exactResponseCacheAllowedForTurn(turn_context: tools_mod.RuntimeTurnContext) bool {
+        // A Minutes-capable turn must never replay or populate the local exact
+        // response cache before the model chooses whether to invoke the tool.
+        // Treat any installed Minutes state as sensitive, including malformed
+        // background contexts that will later fail tool authorization.
+        return tools_mod.isBackgroundTurnOrigin(turn_context.origin) and
+            turn_context.minutes_read_state == null;
     }
 
     fn minutesReadProviderSafe(self: *const Agent) bool {
@@ -5057,7 +5068,7 @@ pub const Agent = struct {
         // it can replay a prior answer into a different interactive context.
         // Exact response cache is limited to background origins; foreground
         // user/MCP prompts must reach the provider unless blocked elsewhere.
-        const allow_exact_response_cache = tools_mod.isBackgroundTurnOrigin(tools_mod.getTurnContext().origin);
+        const allow_exact_response_cache = exactResponseCacheAllowedForTurn(tools_mod.getTurnContext());
         if (allow_exact_response_cache and self.response_cache != null) {
             var key_buf: [16]u8 = undefined;
             const system_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
@@ -8458,6 +8469,24 @@ test "shouldRouteToVisionFallback: native-vision primary keeps the image" {
     try std.testing.expect(!Agent.shouldRouteToVisionFallback("kimi-k2.5", "", true));
     // Primary already IS the sidecar → no-op (no self-swap).
     try std.testing.expect(!Agent.shouldRouteToVisionFallback("llama-vision", "llama-vision", true));
+}
+
+test "exact response cache stays disabled for every Minutes-bearing turn" {
+    var minutes_state = tools_mod.MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
+
+    try std.testing.expect(!Agent.exactResponseCacheAllowedForTurn(.{ .origin = .user }));
+    try std.testing.expect(Agent.exactResponseCacheAllowedForTurn(.{ .origin = .scheduler }));
+    try std.testing.expect(!Agent.exactResponseCacheAllowedForTurn(.{
+        .origin = .scheduler,
+        .entry_kind = .daemon,
+        .minutes_read_state = &minutes_state,
+        .minutes_background_read_authorized = true,
+    }));
+    try std.testing.expect(!Agent.exactResponseCacheAllowedForTurn(.{
+        .origin = .proactive,
+        .minutes_read_state = &minutes_state,
+    }));
 }
 
 test "shouldEscalateOnStuck: G11 one-shot stuck-escalation gate" {

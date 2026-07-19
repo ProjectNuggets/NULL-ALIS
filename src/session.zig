@@ -59,14 +59,37 @@ fn hasMinutesReadTool(tools: []const Tool) bool {
     return false;
 }
 
+const MinutesReadInstallContext = struct {
+    session_key: []const u8,
+    origin: tools_mod.TurnOrigin,
+    entry_kind: tools_mod.EntryKind,
+    background_authorized: bool = false,
+    message_turn_context: ?tools_mod.MessageTurnContext = null,
+};
+
+fn hasAuthoritativeMinutesTenant(session_key: []const u8) bool {
+    const tenant = tools_mod.getTenantContext();
+    const user_id = tenant.user_id orelse return false;
+    const numeric_user_id = tenant.numeric_user_id orelse return false;
+    const tenant_session_key = tenant.session_key orelse return false;
+    if (!std.mem.eql(u8, tenant_session_key, session_key)) return false;
+    const parsed_user_id = std.fmt.parseInt(i64, user_id, 10) catch return false;
+    return parsed_user_id == numeric_user_id;
+}
+
 fn shouldInstallMinutesReadState(
     tools: []const Tool,
-    origin: tools_mod.TurnOrigin,
-    message_turn_context: ?tools_mod.MessageTurnContext,
+    context: MinutesReadInstallContext,
 ) bool {
-    if (tools_mod.isBackgroundTurnOrigin(origin) or !hasMinutesReadTool(tools)) return false;
-    const context = message_turn_context orelse return false;
-    const channel = context.channel orelse return false;
+    if (!hasMinutesReadTool(tools)) return false;
+    if (context.origin == .scheduler) {
+        return context.background_authorized and
+            context.entry_kind == .daemon and
+            hasAuthoritativeMinutesTenant(context.session_key);
+    }
+    if (tools_mod.isBackgroundTurnOrigin(context.origin)) return false;
+    const message_context = context.message_turn_context orelse return false;
+    const channel = message_context.channel orelse return false;
     // Package 1 launches only through the first-party Hub SSE boundary, whose
     // reply buffers and render controls are provenance-aware and zeroized.
     // External channel adapters retain extra transport copies and link-preview
@@ -404,6 +427,10 @@ pub const SessionManager = struct {
         /// False for backend-authored bootstrap turns that must remain model
         /// context without appearing as user-authored transcript history.
         user_visible: bool = true,
+        /// Set only by the daemon's owner-scoped, non-delivery cron lane.
+        /// SessionManager revalidates origin, entry kind, and tenant identity
+        /// before it installs any Minutes capability state.
+        minutes_background_read_authorized: bool = false,
     };
 
     /// Owned reply plus its lifecycle policy. Background and subagent callers
@@ -1290,8 +1317,13 @@ pub const SessionManager = struct {
         defer tools_mod.clearMessageTurnContext();
         const minutes_read_enabled = shouldInstallMinutesReadState(
             self.tools,
-            options.turn_origin,
-            options.message_turn_context,
+            .{
+                .session_key = session_key,
+                .origin = options.turn_origin,
+                .entry_kind = options.entry_kind,
+                .background_authorized = options.minutes_background_read_authorized,
+                .message_turn_context = options.message_turn_context,
+            },
         );
         const minutes_read_state: ?*tools_mod.MinutesReadTurnState = if (minutes_read_enabled) blk: {
             const state = try self.allocator.create(tools_mod.MinutesReadTurnState);
@@ -1310,6 +1342,7 @@ pub const SessionManager = struct {
             .provider = session.agent.default_provider,
             .model = session.agent.model_name,
             .minutes_read_state = minutes_read_state,
+            .minutes_background_read_authorized = minutes_read_enabled and options.turn_origin == .scheduler,
             // Phase 5 T3 — propagate the per-turn Superpowers flag to tools.
             // spawn_many self-gates on this; a non-Superpowers turn cannot
             // fan out. (subagent_batch_result has no Superpowers gate since
@@ -2081,7 +2114,7 @@ test "structured session reply teardown clears display-only text" {
     try testing.expect(std.mem.indexOf(u8, &storage, sentinel) == null);
 }
 
-test "Minutes authorization state is installed only for a registered foreground capability" {
+test "Minutes authorization state is installed for foreground and owner-scoped scheduler capability" {
     const FakeMinutesTool = struct {
         pub const tool_name = tools_mod.minutes_read.MinutesReadTool.tool_name;
         pub const tool_description = "test Minutes capability";
@@ -2101,13 +2134,88 @@ test "Minutes authorization state is installed only for a registered foreground 
     const tools = [_]Tool{minutes.tool()};
     const app_context = tools_mod.MessageTurnContext{ .channel = "zaki_app" };
     const telegram_context = tools_mod.MessageTurnContext{ .channel = "telegram" };
-    try testing.expect(shouldInstallMinutesReadState(&tools, .user, app_context));
-    try testing.expect(shouldInstallMinutesReadState(&tools, .mcp, app_context));
-    try testing.expect(!shouldInstallMinutesReadState(&tools, .heartbeat, app_context));
-    try testing.expect(!shouldInstallMinutesReadState(&tools, .scheduler, app_context));
-    try testing.expect(!shouldInstallMinutesReadState(&tools, .user, telegram_context));
-    try testing.expect(!shouldInstallMinutesReadState(&tools, .user, null));
-    try testing.expect(!shouldInstallMinutesReadState(&.{}, .user, app_context));
+    const session_key = "agent:zaki-bot:user:42:cron:minutes";
+    try testing.expect(shouldInstallMinutesReadState(&tools, .{
+        .session_key = session_key,
+        .origin = .user,
+        .entry_kind = .http,
+        .message_turn_context = app_context,
+    }));
+    try testing.expect(shouldInstallMinutesReadState(&tools, .{
+        .session_key = session_key,
+        .origin = .mcp,
+        .entry_kind = .http,
+        .message_turn_context = app_context,
+    }));
+    try testing.expect(!shouldInstallMinutesReadState(&tools, .{
+        .session_key = session_key,
+        .origin = .heartbeat,
+        .entry_kind = .daemon,
+        .background_authorized = true,
+        .message_turn_context = app_context,
+    }));
+    tools_mod.setTenantContext(.{
+        .user_id = "42",
+        .numeric_user_id = 42,
+        .session_key = session_key,
+    });
+    defer tools_mod.clearTenantContext();
+    try testing.expect(shouldInstallMinutesReadState(&tools, .{
+        .session_key = session_key,
+        .origin = .scheduler,
+        .entry_kind = .daemon,
+        .background_authorized = true,
+    }));
+    tools_mod.setTenantContext(.{
+        .user_id = "42",
+        .numeric_user_id = 7,
+        .session_key = session_key,
+    });
+    try testing.expect(!shouldInstallMinutesReadState(&tools, .{
+        .session_key = session_key,
+        .origin = .scheduler,
+        .entry_kind = .daemon,
+        .background_authorized = true,
+    }));
+    tools_mod.setTenantContext(.{
+        .user_id = "42",
+        .numeric_user_id = 42,
+        .session_key = "agent:zaki-bot:user:42:cron:other",
+    });
+    try testing.expect(!shouldInstallMinutesReadState(&tools, .{
+        .session_key = session_key,
+        .origin = .scheduler,
+        .entry_kind = .daemon,
+        .background_authorized = true,
+    }));
+    try testing.expect(!shouldInstallMinutesReadState(&tools, .{
+        .session_key = session_key,
+        .origin = .scheduler,
+        .entry_kind = .daemon,
+    }));
+    try testing.expect(!shouldInstallMinutesReadState(&tools, .{
+        .session_key = session_key,
+        .origin = .scheduler,
+        .entry_kind = .http,
+        .background_authorized = true,
+    }));
+    try testing.expect(!shouldInstallMinutesReadState(&tools, .{
+        .session_key = session_key,
+        .origin = .user,
+        .entry_kind = .http,
+        .message_turn_context = telegram_context,
+    }));
+    try testing.expect(!shouldInstallMinutesReadState(&tools, .{
+        .session_key = session_key,
+        .origin = .user,
+        .entry_kind = .http,
+    }));
+    try testing.expect(!shouldInstallMinutesReadState(&.{}, .{
+        .session_key = session_key,
+        .origin = .user,
+        .entry_kind = .http,
+        .message_turn_context = app_context,
+    }));
 }
 
 test "Minutes display-only outcome is not retained for session replay" {

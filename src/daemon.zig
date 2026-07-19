@@ -1807,6 +1807,11 @@ fn runCronAgentTurnWithBus(
         // turns run with `usage_rt = null` (no SSE done frame). Tag `.daemon`
         // so the durable `turn_usage` row is written + reconcilable by the BFF.
         .entry_kind = .daemon,
+        .minutes_background_read_authorized = cronMinutesBackgroundReadAuthorized(
+            turn_origin,
+            scheduler.context_user_id,
+            numeric_user_id,
+        ),
     });
     return .{
         .output = result.text,
@@ -1841,6 +1846,18 @@ fn resolveCronTurnOrigin(job: *const cron.CronJob) tools_mod.TurnOrigin {
         .none => .scheduler,
         else => .proactive,
     };
+}
+
+fn cronMinutesBackgroundReadAuthorized(
+    origin: tools_mod.TurnOrigin,
+    user_id: ?[]const u8,
+    numeric_user_id: ?i64,
+) bool {
+    if (origin != .scheduler) return false;
+    const raw_user_id = user_id orelse return false;
+    const scoped_numeric_id = numeric_user_id orelse return false;
+    const parsed_user_id = std.fmt.parseInt(i64, raw_user_id, 10) catch return false;
+    return parsed_user_id == scoped_numeric_id;
 }
 
 const CronSessionLaneResolution = struct {
@@ -4109,6 +4126,16 @@ test "resolveCronTurnOrigin keeps scheduler origin for non-delivery jobs" {
         .delivery = .{ .mode = .none },
     };
     try std.testing.expectEqual(tools_mod.TurnOrigin.scheduler, resolveCronTurnOrigin(&job));
+}
+
+test "Minutes background grant requires an owner-scoped scheduler lane" {
+    try std.testing.expect(cronMinutesBackgroundReadAuthorized(.scheduler, "42", 42));
+    try std.testing.expect(!cronMinutesBackgroundReadAuthorized(.scheduler, null, null));
+    try std.testing.expect(!cronMinutesBackgroundReadAuthorized(.scheduler, "not-a-user", 42));
+    try std.testing.expect(!cronMinutesBackgroundReadAuthorized(.scheduler, "42", 7));
+    try std.testing.expect(!cronMinutesBackgroundReadAuthorized(.heartbeat, "42", 42));
+    try std.testing.expect(!cronMinutesBackgroundReadAuthorized(.wake, "42", 42));
+    try std.testing.expect(!cronMinutesBackgroundReadAuthorized(.proactive, "42", 42));
 }
 
 test "resolveCronSessionTarget reroutes non-user main target to isolated" {
