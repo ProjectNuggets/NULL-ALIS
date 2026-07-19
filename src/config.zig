@@ -4572,7 +4572,7 @@ test "session config parses cross_channel_shared_main" {
     try std.testing.expect(!cfg.session.cross_channel_shared_main);
 }
 
-test "profile zaki_bot enables http request defaults" {
+test "WP-SEC1: zaki_bot does not advertise http request without an allowlist" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -4582,7 +4582,7 @@ test "profile zaki_bot enables http request defaults" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("zaki_bot", cfg.profile);
-    try std.testing.expect(cfg.http_request.enabled);
+    try std.testing.expect(!cfg.http_request.enabled);
     try std.testing.expect(cfg.autonomy.level == .supervised);
     try std.testing.expectEqual(true, cfg.security.sandbox.enabled.?);
     try std.testing.expect(!cfg.security.sandbox.fail_open_on_dev);
@@ -4604,6 +4604,20 @@ test "profile zaki_bot enables http request defaults" {
     try std.testing.expectEqualStrings("on", cfg.memory.reliability.rollout_mode);
     try std.testing.expect(cfg.memory.search.query.hybrid.mmr.enabled);
     try std.testing.expect(cfg.memory.search.query.hybrid.temporal_decay.enabled);
+}
+
+test "WP-SEC1: zaki_bot enables http request when an allowlist is configured" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"profile": "zaki_bot", "http_request": {"allowed_domains": ["api.example.com"]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.http_request.enabled);
+    try std.testing.expectEqual(@as(usize, 1), cfg.http_request.allowed_domains.len);
+    try std.testing.expectEqualStrings("api.example.com", cfg.http_request.allowed_domains[0]);
 }
 
 test "profile defaults do not override explicit http request disable" {
@@ -5045,7 +5059,7 @@ test "save and parse preserve profile" {
     try loaded.parseJson(content);
 
     try std.testing.expectEqualStrings("zaki_bot", loaded.profile);
-    try std.testing.expect(loaded.http_request.enabled);
+    try std.testing.expect(!loaded.http_request.enabled);
 }
 
 test "image_model config: parsed and defaults to empty" {

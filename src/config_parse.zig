@@ -2357,8 +2357,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
-    if (types.AppProfile.fromString(self.profile) == .zaki_bot and root.get("http_request") == null) {
-        self.http_request.enabled = true;
+    if (types.AppProfile.fromString(self.profile) == .zaki_bot and self.http_request.allowed_domains.len == 0) {
+        // `http_request` fails closed without destinations. Do not advertise
+        // an always-erroring tool in the production profile, even if enabled
+        // was explicitly set without the required allowlist.
+        self.http_request.enabled = false;
     }
 
     // Default named agent: inject `scientific_researcher` when the operator
