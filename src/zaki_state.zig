@@ -22147,6 +22147,69 @@ test "P7 person-as-subject — extracted edge makes the subject a resolvable nod
         try std.testing.expectEqualStrings("0", entity_count);
         try std.testing.expectEqualStrings("0", edge_count);
     }
+
+    // ── Facts 4–5: sentinel predicates may retain their durable fact for
+    //    audit/recall, but must never materialize either endpoint or an edge.
+    const rejected_predicate_facts = [_]extraction_persist.ExtractedMemory{
+        .{
+            .text = "Sentinel Alpha found no connection to Sentinel Beta",
+            .subject = "Sentinel Alpha",
+            .predicate = "NO_CONNECTION_FOUND",
+            .object = "Sentinel Beta",
+            .attributed_to = "user",
+            .confidence = 0.9,
+        },
+        .{
+            .text = "Sentinel Gamma describes Sentinel Delta",
+            .subject = "Sentinel Gamma",
+            .predicate = "DESCRIPTION",
+            .object = "Sentinel Delta",
+            .attributed_to = "user",
+            .confidence = 0.9,
+        },
+    };
+    const r4 = try extraction_persist.persistExtracted(
+        allocator,
+        &mgr,
+        2,
+        "p7-subject-session",
+        &rejected_predicate_facts,
+        null,
+        coref,
+        null,
+        .test_wire,
+        0,
+        true,
+    );
+    try std.testing.expectEqual(@as(usize, 2), r4.written_count);
+    try std.testing.expectEqual(@as(usize, 2), r4.suppressed_predicate_graph);
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT " ++
+                "(SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND content IN " ++
+                "('Sentinel Alpha found no connection to Sentinel Beta', 'Sentinel Gamma describes Sentinel Delta')), " ++
+                "(SELECT COUNT(*) FROM {s}.memory_entities WHERE user_id = 2 AND name_lower IN " ++
+                "('sentinel alpha', 'sentinel beta', 'sentinel gamma', 'sentinel delta')), " ++
+                "(SELECT COUNT(*) FROM {s}.memory_edges WHERE user_id = 2 AND fact IN " ++
+                "('Sentinel Alpha found no connection to Sentinel Beta', 'Sentinel Gamma describes Sentinel Delta'))",
+            .{ schema_q, schema_q, schema_q },
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const memory_count = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(memory_count);
+        const entity_count = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(entity_count);
+        const edge_count = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(edge_count);
+        try std.testing.expectEqualStrings("2", memory_count);
+        try std.testing.expectEqualStrings("0", entity_count);
+        try std.testing.expectEqualStrings("0", edge_count);
+    }
 }
 
 test "brain-leak A: scaffold triples rejected at persist write boundary; real fact persists" {

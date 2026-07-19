@@ -118,7 +118,7 @@ test "memory contract: scaffold entity names are denied, near-misses are not" {
     try std.testing.expect(!context_builder.isScaffoldEntityName("Acme Corp"));
 }
 
-test "memory contract: extraction persistence rejects non-relational sentinel predicates" {
+test "memory contract: extraction persistence suppresses graph writes for non-relational sentinel predicates" {
     // extraction_persist imports memory/root, so importing it back from this
     // root-hosted contract test would create a module cycle. Pin the exact
     // write-boundary constant block instead: moving or removing either entry

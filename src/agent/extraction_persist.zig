@@ -16,9 +16,9 @@
 //!
 //! ## Pipeline (each ExtractedMemory)
 //!
-//! 1. **Reject heuristics** — drop facts whose `predicate` is in the
-//!    rejected-predicate blacklist (covers cases where the LLM emitted
-//!    meta-narrative despite the prompt's anti-meta rules).
+//! 1. **Graph suppression heuristics** — retain facts whose `predicate` is
+//!    in the rejected-predicate set for audit/recall, but do not resolve
+//!    endpoints or materialize graph edges for them.
 //! 2. **SHA-256 content_hash dedup** — if a memory with identical
 //!    normalized content already exists for this user, skip silently
 //!    (Mem0-style pre-filter, gap #13 from audit). Previously used MD5
@@ -124,18 +124,18 @@ pub fn parseValidAtIso(iso_opt: ?[]const u8) ?i64 {
     if (day < 1 or day > 31) return null;
     const leap_now = (@mod(year, 4) == 0 and @mod(year, 100) != 0) or (@mod(year, 400) == 0);
     const max_day_per_month = [_]u8{
-        31,                       // Jan
+        31, // Jan
         if (leap_now) 29 else 28, // Feb
-        31,                       // Mar
-        30,                       // Apr
-        31,                       // May
-        30,                       // Jun
-        31,                       // Jul
-        31,                       // Aug
-        30,                       // Sep
-        31,                       // Oct
-        30,                       // Nov
-        31,                       // Dec
+        31, // Mar
+        30, // Apr
+        31, // May
+        30, // Jun
+        31, // Jul
+        31, // Aug
+        30, // Sep
+        31, // Oct
+        30, // Nov
+        31, // Dec
     };
     if (day > max_day_per_month[@as(usize, @intCast(month)) - 1]) return null;
     const days_per_month = [_]u32{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
@@ -186,7 +186,7 @@ test "parseValidAtIso returns null on too-short input" {
 
 pub const PersistResult = struct {
     written_count: usize,
-    skipped_blacklist: usize,
+    suppressed_predicate_graph: usize,
     skipped_md5_dup: usize,
     skipped_cosine_dup: usize,
     /// V1.6 commit 6 — facts the contradiction judge marked as semantic
@@ -201,8 +201,8 @@ pub const PersistResult = struct {
     contradictions_resolved: usize = 0,
     /// Brain-leak Fix A — facts rejected because their subject OR object is a
     /// system-prompt scaffold artifact (`isRejectedEntityName`). Distinct from
-    /// `skipped_blacklist` (predicate denylist) so observability can tell the
-    /// two write-boundary defenses apart.
+    /// `suppressed_predicate_graph` so observability can tell a preserved
+    /// fact with no graph materialization from a fully rejected scaffold fact.
     skipped_scaffold: usize = 0,
     failed_count: usize,
 };
@@ -1365,7 +1365,7 @@ pub const WriteOrigin = enum {
 /// Provider-agnostic. The `memories` slice can come from the compaction
 /// LLM (today's primary path), agent tool writes, or the classifier
 /// when those land. Each fact passes through:
-///   1. predicate blacklist (defense-in-depth against meta-narrative)
+///   1. predicate graph suppression (preserve fact; omit entities/edges)
 ///   2. SHA-256 content_hash dedup pre-filter (V1.6 5b.3 — exact-byte match)
 ///   3. **V1.6 commit 6**: contradiction LLM judge when `judge` provided
 ///      a. duplicate detected → skip (treat as semantic-dup of existing row)
@@ -1388,12 +1388,12 @@ pub const WriteOrigin = enum {
 /// for rows that have a real origin.
 fn originToExtractionPass(origin: WriteOrigin) []const u8 {
     return switch (origin) {
-        .pass_a_drop               => "pass_a",
+        .pass_a_drop => "pass_a",
         .pass_c_compaction_extract => "pass_c",
-        .session_end_extract       => "session_end",
-        .memory_store_tool         => "tool",
-        .test_wire                 => "test",
-        else                       => "unknown",
+        .session_end_extract => "session_end",
+        .memory_store_tool => "tool",
+        .test_wire => "test",
+        else => "unknown",
     };
 }
 
@@ -1436,7 +1436,7 @@ pub fn persistExtracted(
 ) !PersistResult {
     var result = PersistResult{
         .written_count = 0,
-        .skipped_blacklist = 0,
+        .suppressed_predicate_graph = 0,
         .skipped_md5_dup = 0,
         .skipped_cosine_dup = 0,
         .skipped_semantic_dup = 0,
@@ -1449,10 +1449,9 @@ pub fn persistExtracted(
     //
     // V1.14.12 (M1 review MEDIUM#2) — renamed `count` → `attempted` to
     // reflect that this is INPUT cardinality, not write cardinality.
-    // Blacklist + MD5 + cardinality fast-path + judge skips can all
-    // reduce attempted → written. The trailing log line at end of
-    // batch reports `written` + `skipped_total` so M3/M5 redundancy
-    // decisions get accurate numerators/denominators.
+    // MD5 + cardinality fast-path + judge skips can all reduce attempted →
+    // written. Predicate graph suppression is orthogonal: the fact is written,
+    // but no entity/edge is materialized.
     log.info(
         "memory.write.batch origin={s} attempted={d} user_id={d} session={s} judge={s}",
         .{
@@ -1465,11 +1464,13 @@ pub fn persistExtracted(
     );
 
     for (memories) |m| {
-        // Step 1: predicate blacklist
-        if (isRejectedPredicate(m.predicate)) {
+        // Step 1: predicate graph blacklist. Preserve the durable fact so an
+        // operator can audit/curate classifier output, but never resolve its
+        // endpoints or materialize an edge from a non-relational sentinel.
+        const suppress_graph = isRejectedPredicate(m.predicate);
+        if (suppress_graph) {
             log.warn("extraction.rejected_predicate predicate={s} subject={s}", .{ m.predicate, m.subject });
-            result.skipped_blacklist += 1;
-            continue;
+            result.suppressed_predicate_graph += 1;
         }
 
         // Step 1b (brain-leak Fix A): entity-name denylist. Reject the WHOLE
@@ -1748,7 +1749,7 @@ pub fn persistExtracted(
         // Speaker/self pseudo-entities can occur on either endpoint. They are
         // conversation participants, not durable graph entities, so keep the
         // memory fact but omit entity resolution and edge materialization.
-        const target_key: ?[]u8 = if (isSelfPseudoSubject(m.object))
+        const target_key: ?[]u8 = if (suppress_graph or isSelfPseudoSubject(m.object))
             null
         else
             resolveEntityKey(allocator, state_mgr, user_id, m.object, "PROPER", coref) catch |err| blk: {
@@ -1766,7 +1767,7 @@ pub fn persistExtracted(
         // hub), not entities. Best-effort: subject-resolution failure never
         // aborts the object edge below. `'PROPER'` here can only UPGRADE the
         // row (the no-clobber rule in upsertEntity protects a known type).
-        const subject_key: ?[]u8 = if (isSelfPseudoSubject(m.subject))
+        const subject_key: ?[]u8 = if (suppress_graph or isSelfPseudoSubject(m.subject))
             null
         else
             resolveEntityKey(allocator, state_mgr, user_id, m.subject, "PROPER", coref) catch |err| blk: {
@@ -1888,14 +1889,14 @@ pub fn persistExtracted(
     // WRITTEN counts (not attempted) to decide whether direct paths
     // are subsumed by extract paths.
     log.info(
-        "memory.write.batch_done origin={s} attempted={d} written={d} skipped_md5={d} skipped_semantic={d} skipped_blacklist={d} skipped_scaffold={d} contradictions={d} failed={d}",
+        "memory.write.batch_done origin={s} attempted={d} written={d} skipped_md5={d} skipped_semantic={d} suppressed_predicate_graph={d} skipped_scaffold={d} contradictions={d} failed={d}",
         .{
             origin.toSlice(),
             memories.len,
             result.written_count,
             result.skipped_md5_dup,
             result.skipped_semantic_dup,
-            result.skipped_blacklist,
+            result.suppressed_predicate_graph,
             result.skipped_scaffold,
             result.contradictions_resolved,
             result.failed_count,
@@ -2537,12 +2538,12 @@ test "V1.14.12 (M1): WriteOrigin tags are stable strings for log analyzers" {
 }
 
 test "originToExtractionPass maps all expected origins" {
-    try std.testing.expectEqualStrings("pass_a",      originToExtractionPass(.pass_a_drop));
-    try std.testing.expectEqualStrings("pass_c",      originToExtractionPass(.pass_c_compaction_extract));
+    try std.testing.expectEqualStrings("pass_a", originToExtractionPass(.pass_a_drop));
+    try std.testing.expectEqualStrings("pass_c", originToExtractionPass(.pass_c_compaction_extract));
     try std.testing.expectEqualStrings("session_end", originToExtractionPass(.session_end_extract));
-    try std.testing.expectEqualStrings("tool",        originToExtractionPass(.memory_store_tool));
-    try std.testing.expectEqualStrings("test",        originToExtractionPass(.test_wire));
-    try std.testing.expectEqualStrings("unknown",     originToExtractionPass(.unknown));
+    try std.testing.expectEqualStrings("tool", originToExtractionPass(.memory_store_tool));
+    try std.testing.expectEqualStrings("test", originToExtractionPass(.test_wire));
+    try std.testing.expectEqualStrings("unknown", originToExtractionPass(.unknown));
 }
 
 test "V1.14.12 (M1 + Path A): WriteOrigin enum count guards against silent additions" {
