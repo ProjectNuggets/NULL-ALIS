@@ -901,6 +901,42 @@ fn promptChoice(out: *std.Io.Writer, buf: []u8, max: usize, default_idx: usize) 
 
 const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
 const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous" };
+
+fn apply_autonomy_selection(cfg: *Config, autonomy_idx: usize, full_acknowledged: bool) error{FullAutonomyAcknowledgementRequired}!void {
+    if (autonomy_idx != 0 and autonomy_idx < autonomy_options.len and !full_acknowledged) {
+        return error.FullAutonomyAcknowledgementRequired;
+    }
+
+    switch (autonomy_idx) {
+        0 => {
+            cfg.autonomy.level = .supervised;
+            cfg.autonomy.full_acknowledged = false;
+            cfg.autonomy.require_approval_for_medium_risk = true;
+            cfg.autonomy.block_high_risk_commands = true;
+        },
+        1 => {
+            // "autonomous": fully acts, but still blocks high-risk commands.
+            cfg.autonomy.level = .full;
+            cfg.autonomy.full_acknowledged = true;
+            cfg.autonomy.require_approval_for_medium_risk = false;
+            cfg.autonomy.block_high_risk_commands = true;
+        },
+        2 => {
+            // "fully_autonomous": fully acts and does not hard-block high-risk commands.
+            cfg.autonomy.level = .full;
+            cfg.autonomy.full_acknowledged = true;
+            cfg.autonomy.require_approval_for_medium_risk = false;
+            cfg.autonomy.block_high_risk_commands = false;
+        },
+        else => {
+            cfg.autonomy.level = .supervised;
+            cfg.autonomy.full_acknowledged = false;
+            cfg.autonomy.require_approval_for_medium_risk = true;
+            cfg.autonomy.block_high_risk_commands = true;
+        },
+    }
+}
+
 const wizard_memory_backend_order = [_][]const u8{
     "sqlite",
     "markdown",
@@ -1434,30 +1470,30 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         try out.flush();
         return;
     };
-    switch (autonomy_idx) {
-        0 => {
-            cfg.autonomy.level = .supervised;
-            cfg.autonomy.require_approval_for_medium_risk = true;
-            cfg.autonomy.block_high_risk_commands = true;
-        },
-        1 => {
-            // "autonomous": fully acts, but still blocks high-risk commands.
-            cfg.autonomy.level = .full;
-            cfg.autonomy.require_approval_for_medium_risk = false;
-            cfg.autonomy.block_high_risk_commands = true;
-        },
-        2 => {
-            // "fully_autonomous": fully acts and does not hard-block high-risk commands.
-            cfg.autonomy.level = .full;
-            cfg.autonomy.require_approval_for_medium_risk = false;
-            cfg.autonomy.block_high_risk_commands = false;
-        },
-        else => {
-            cfg.autonomy.level = .supervised;
-            cfg.autonomy.require_approval_for_medium_risk = true;
-            cfg.autonomy.block_high_risk_commands = true;
-        },
+    var full_acknowledged = false;
+    if (autonomy_idx != 0) {
+        try out.writeAll(
+            "\n  Full autonomy acts without per-action approval and may modify files, run commands, or make external requests.\n",
+        );
+        if (autonomy_idx == 1) {
+            try out.writeAll("  High-risk commands remain blocked in autonomous mode.\n");
+        } else {
+            try out.writeAll("  fully_autonomous also removes the hard block on high-risk commands.\n");
+        }
+        try out.writeAll("  Type FULL to acknowledge these risks: ");
+        const acknowledgement = prompt(out, &input_buf, "", "") orelse {
+            try out.writeAll("\n  Aborted. Full autonomy was not enabled.\n");
+            try out.flush();
+            return;
+        };
+        if (!std.mem.eql(u8, acknowledgement, "FULL")) {
+            try out.writeAll("  Aborted. Full autonomy was not enabled.\n");
+            try out.flush();
+            return;
+        }
+        full_acknowledged = true;
     }
+    try apply_autonomy_selection(&cfg, autonomy_idx, full_acknowledged);
     try out.print("  -> {s}\n\n", .{autonomy_options[autonomy_idx]});
 
     // ── Step 7: Channels ──
@@ -2736,12 +2772,78 @@ test "findChannelOptionIndex supports number and key" {
 }
 
 test "wizard maps autonomy index to enum correctly" {
-    // Verify the mapping used in runWizard
-    const Config2 = @import("config.zig");
-    const mapping = [_]Config2.AutonomyLevel{ .supervised, .full, .full };
-    try std.testing.expect(mapping[0] == .supervised);
-    try std.testing.expect(mapping[1] == .full);
-    try std.testing.expect(mapping[2] == .full);
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    try apply_autonomy_selection(&cfg, 0, false);
+    try std.testing.expectEqual(config_mod.AutonomyLevel.supervised, cfg.autonomy.level);
+    try std.testing.expect(!cfg.autonomy.full_acknowledged);
+
+    try std.testing.expectError(error.FullAutonomyAcknowledgementRequired, apply_autonomy_selection(&cfg, 1, false));
+    try apply_autonomy_selection(&cfg, 1, true);
+    try std.testing.expectEqual(config_mod.AutonomyLevel.full, cfg.autonomy.level);
+    try std.testing.expect(cfg.autonomy.full_acknowledged);
+    try std.testing.expect(cfg.autonomy.block_high_risk_commands);
+
+    try std.testing.expectError(error.FullAutonomyAcknowledgementRequired, apply_autonomy_selection(&cfg, 2, false));
+    try apply_autonomy_selection(&cfg, 2, true);
+    try std.testing.expectEqual(config_mod.AutonomyLevel.full, cfg.autonomy.level);
+    try std.testing.expect(cfg.autonomy.full_acknowledged);
+    try std.testing.expect(!cfg.autonomy.block_high_risk_commands);
+}
+
+test "WP-SEC1: wizard full autonomy acknowledgement survives save and validation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+        .profile = "zaki_bot",
+        .default_provider = "together-ai",
+        .default_model = "moonshotai/Kimi-K2.6",
+    };
+    cfg.providers = &.{
+        .{ .name = "together-ai", .api_key = "together-valid-key", .base_url = "https://api.together.xyz/v1" },
+    };
+    cfg.gateway.internal_service_tokens = &.{"prod-internal-token-1234"};
+    cfg.state.backend = "postgres";
+    cfg.state.postgres.connection_string = "postgresql://zaki:zaki@127.0.0.1:5432/zaki";
+    cfg.security.sandbox.enabled = true;
+
+    try std.testing.expectError(error.FullAutonomyAcknowledgementRequired, apply_autonomy_selection(&cfg, 1, false));
+    try std.testing.expectEqual(config_mod.AutonomyLevel.supervised, cfg.autonomy.level);
+    try std.testing.expect(!cfg.autonomy.full_acknowledged);
+
+    try apply_autonomy_selection(&cfg, 1, true);
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    try loaded.parseJson(content);
+    try std.testing.expectEqual(config_mod.AutonomyLevel.full, loaded.autonomy.level);
+    try std.testing.expect(loaded.autonomy.full_acknowledged);
+    try loaded.validate();
+
+    try apply_autonomy_selection(&loaded, 0, false);
+    try std.testing.expectEqual(config_mod.AutonomyLevel.supervised, loaded.autonomy.level);
+    try std.testing.expect(!loaded.autonomy.full_acknowledged);
 }
 
 // ── New template tests ──────────────────────────────────────────
