@@ -283,7 +283,7 @@ pub const EntityResolution = struct {
 /// to the brain.
 ///
 /// Kept here as an array (not a hashmap) because the list is small
-/// and lookups are per-fact-write — O(N*K) with N=facts, K=15 is
+/// and lookups are per-fact-write — O(N*K) with N=facts and a small K is
 /// negligible.
 const REJECTED_PREDICATES = [_][]const u8{
     "GREETED",
@@ -301,6 +301,8 @@ const REJECTED_PREDICATES = [_][]const u8{
     "IS_UNKNOWN",
     "EXPRESSED_READINESS",
     "INITIATED_CONVERSATION",
+    "NO_CONNECTION_FOUND",
+    "DESCRIPTION",
     // P7 — entity_pipeline speaker hub predicate (RENAMED from "MENTIONED").
     // Keep it rejected at this write-time defense-in-depth filter too, so the
     // gateway blacklist (gateway.isRejectedExtractionPredicate) and this list
@@ -1743,11 +1745,17 @@ pub fn persistExtracted(
         // Either way: every fact about the same object lands on the same
         // graph node — the difference is whether "Helix" and "Helix editor"
         // collapse to ONE node (cosine yes, hash no).
-        const target_key = resolveEntityKey(allocator, state_mgr, user_id, m.object, "PROPER", coref) catch |err| blk: {
-            log.warn("extraction.entity_resolve_failed err={s} object={s}", .{ @errorName(err), m.object });
-            // Final fallback: hash-only key so the edge still writes
-            break :blk deriveEntityKey(allocator, m.object) catch null;
-        };
+        // Speaker/self pseudo-entities can occur on either endpoint. They are
+        // conversation participants, not durable graph entities, so keep the
+        // memory fact but omit entity resolution and edge materialization.
+        const target_key: ?[]u8 = if (isSelfPseudoSubject(m.object))
+            null
+        else
+            resolveEntityKey(allocator, state_mgr, user_id, m.object, "PROPER", coref) catch |err| blk: {
+                log.warn("extraction.entity_resolve_failed err={s} object={s}", .{ @errorName(err), m.object });
+                // Final fallback: hash-only key so the edge still writes
+                break :blk deriveEntityKey(allocator, m.object) catch null;
+            };
 
         // P7 (CRM substrate) — resolve the SUBJECT to an entity node too, when
         // it is a named entity (e.g. a person), so "Tarek WORKS_AT Acme" makes
@@ -1992,16 +2000,16 @@ fn resolveEntityKey(
     return new_id;
 }
 
-/// P7 — is this triple subject the speaker/self pseudo-subject rather than a
+/// P7 — is this triple endpoint a speaker/self pseudo-entity rather than a
 /// named graph entity? "user" / "assistant" / "I" / "me" / "you" denote the
 /// conversation participants (the speaker hub `user:<id>`), NOT first-class
 /// entity nodes. Everything else (a person's name like "Tarek", an org, …) is
 /// a named entity that SHOULD become its own resolvable node so
 /// "Tarek WORKS_AT Acme" makes Tarek a node — not just Acme. Case-insensitive.
-fn isSelfPseudoSubject(subject: []const u8) bool {
+fn isSelfPseudoSubject(endpoint: []const u8) bool {
     const self_terms = [_][]const u8{ "user", "assistant", "i", "me", "you", "we", "self" };
     for (self_terms) |t| {
-        if (std.ascii.eqlIgnoreCase(t, subject)) return true;
+        if (std.ascii.eqlIgnoreCase(t, endpoint)) return true;
     }
     return false;
 }
@@ -2236,6 +2244,8 @@ test "isRejectedPredicate covers known meta-narrative predicates" {
     try std.testing.expect(isRejectedPredicate("GREETED"));
     try std.testing.expect(isRejectedPredicate("SAID"));
     try std.testing.expect(isRejectedPredicate("ACKNOWLEDGED"));
+    try std.testing.expect(isRejectedPredicate("NO_CONNECTION_FOUND"));
+    try std.testing.expect(isRejectedPredicate("DESCRIPTION"));
     try std.testing.expect(!isRejectedPredicate("PREFERS"));
     try std.testing.expect(!isRejectedPredicate("DEPLOYS_TO"));
     try std.testing.expect(!isRejectedPredicate("BIRTHDAY"));
