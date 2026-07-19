@@ -7405,14 +7405,28 @@ test "/learn adopt on a legacy fact (no metadata header at all) reports 'already
 }
 
 test "WP-MEM8: session end delegates graph edges to the entity pipeline" {
-    // Architecture regression guard: the session-end summarizer may persist
-    // durable facts, but graph edges belong to the classifier pipeline. Keep
-    // the legacy identifiers split so this test does not match itself.
+    // Architecture regression guard scoped to the session-end summarizer:
+    // it persists durable facts and delegates graph writes to the configured
+    // classifier pipeline. Unrelated graph writers elsewhere in this large
+    // module must not make this contract fail.
     const source = @embedFile("commands.zig");
+    const function_start = std.mem.indexOf(u8, source, "fn persistSessionSemanticSummary(") orelse
+        return error.TestExpectedEqual;
+    const function_end_relative = std.mem.indexOf(
+        u8,
+        source[function_start..],
+        "\npub fn persistSessionCheckpoint(",
+    ) orelse return error.TestExpectedEqual;
+    const function_source = source[function_start .. function_start + function_end_relative];
     const legacy_origin = "session_end_" ++ "loop";
     const legacy_key_helper = "deriveSessionEnd" ++ "EntityKey";
 
-    try std.testing.expect(std.mem.indexOf(u8, source, legacy_origin) == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, legacy_key_helper) == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "enqueueExtractionJob") != null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "deriveDurableFactKey") != null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "mem.store(fact_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "session_end_entity_pipeline_enabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "enqueueExtractionJob(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "\"session_end\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, ".upsertMemoryEdge(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, legacy_origin) == null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, legacy_key_helper) == null);
 }

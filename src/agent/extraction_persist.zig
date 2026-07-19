@@ -2014,12 +2014,11 @@ fn isSelfPseudoSubject(subject: []const u8) bool {
 /// `entity_<hex>` where `<hex>` is the first 8 bytes of the SHA-256 of the
 /// canonicalized object.
 ///
-/// The `lowerForEntityKey` canonicalization is load-bearing: it is the
-/// SAME helper `commands.deriveSessionEndEntityKey` and the PG cmt16
-/// backfill SQL route their input through, so all three paths produce
+/// The `lowerForEntityKey` canonicalization is load-bearing: the PG cmt16
+/// backfill SQL mirrors it so runtime extraction and backfill produce
 /// byte-identical keys for the same surface form regardless of casing —
-/// re-extraction then collides on the primary key (`ON CONFLICT DO
-/// NOTHING`) instead of writing a duplicate row. Caller frees the slice.
+/// re-extraction then collides on the primary key (`ON CONFLICT DO NOTHING`)
+/// instead of writing a duplicate row. Caller frees the slice.
 fn deriveEntityKey(allocator: std.mem.Allocator, object: []const u8) ![]u8 {
     const lower = try lowerForEntityKey(allocator, object);
     defer allocator.free(lower);
@@ -2033,11 +2032,10 @@ fn deriveEntityKey(allocator: std.mem.Allocator, object: []const u8) ![]u8 {
 }
 
 /// V1.7a-4 (closes V1.6 ship-review WR-02) — canonicalization helper for
-/// entity-key hashing. Both `extraction_persist.deriveEntityKey` and
-/// `commands.deriveSessionEndEntityKey` route every `object` string through
-/// this before SHA-256. The PG cmt16 backfill SQL must also call PG's
-/// `lower(...)` (Unicode-aware) on the same input, so all three paths
-/// produce byte-identical hashes for the same surface form.
+/// entity-key hashing. `extraction_persist.deriveEntityKey` routes every
+/// `object` string through this before SHA-256. The PG cmt16 backfill SQL
+/// must also call PG's `lower(...)` (Unicode-aware) on the same input so
+/// backfill and runtime extraction produce byte-identical hashes.
 ///
 /// Coverage (matches PG `lower(...)` in standard UTF-8 locales for these ranges):
 ///   - ASCII A-Z → a-z
