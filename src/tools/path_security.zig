@@ -40,6 +40,30 @@ pub const SYSTEM_BLOCKED_PREFIXES: []const []const u8 = if (@import("builtin").o
 else
     &SYSTEM_BLOCKED_PREFIXES_UNIX;
 
+/// Agent control-plane directories that live INSIDE the agent's own writable workspace.
+///
+/// In the user-cell pod shape HOME is `{workspace}/.home` (gateway.zig), so `~/.nullalis/cron.json`
+/// and `~/.nullalis/auth.json` resolve *under the workspace prefix* — which the check below would
+/// otherwise allow outright. Writing those is not a file edit, it is a privilege change:
+///   - `cron.json` installs durable jobs the scheduler re-reads every tick and runs as agent turns,
+///     i.e. a self-retriggering foothold that outlives the session;
+///   - `auth.json` holds provider credentials.
+/// That is precisely the persistence threat the `cron_add`/`schedule` approval gate exists to stop,
+/// reachable without the cron tool at all. Deny it at the path layer so it holds for every tool and
+/// every autonomy level, rather than depending on which tools happen to be approval-gated today.
+const WORKSPACE_CONTROL_PLANE_DIRS = [_][]const u8{ ".nullalis", ".home" };
+
+/// True when a resolved path lands inside the agent's control plane within its own workspace.
+fn isWorkspaceControlPlanePath(resolved: []const u8, ws_resolved: []const u8) bool {
+    if (!pathStartsWith(resolved, ws_resolved)) return false;
+    var rel = resolved[ws_resolved.len..];
+    while (rel.len > 0 and (rel[0] == '/' or rel[0] == '\\')) rel = rel[1..];
+    for (WORKSPACE_CONTROL_PLANE_DIRS) |dir| {
+        if (pathStartsWith(rel, dir)) return true;
+    }
+    return false;
+}
+
 /// Check whether a directory-style prefix matches (exact or followed by a path separator).
 pub fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
     if (!std.mem.startsWith(u8, path, prefix)) return false;
@@ -50,6 +74,7 @@ pub fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
 
 /// Check whether a **resolved** absolute path is allowed by the policy:
 ///  1. System blocklist always rejects.
+///  1b. Agent control plane inside the workspace always rejects (see WORKSPACE_CONTROL_PLANE_DIRS).
 ///  2. Workspace prefix matches → allowed.
 ///  3. Any allowed_path prefix matches (resolved on the fly) → allowed.
 pub fn isResolvedPathAllowed(
@@ -62,6 +87,9 @@ pub fn isResolvedPathAllowed(
     for (SYSTEM_BLOCKED_PREFIXES) |prefix| {
         if (pathStartsWith(resolved, prefix)) return false;
     }
+    // 1b. Control plane — MUST precede the workspace allow below, because these dirs live inside
+    // the workspace and would otherwise be allowed by prefix match.
+    if (isWorkspaceControlPlanePath(resolved, ws_resolved)) return false;
     // 2. Workspace
     if (pathStartsWith(resolved, ws_resolved)) return true;
     // 3. Allowed paths (resolve each to handle symlinks)
@@ -233,4 +261,86 @@ test "pathStartsWith with trailing component" {
 
 test "pathStartsWith rejects partial" {
     try std.testing.expect(!pathStartsWith("/foo/barbaz", "/foo/bar"));
+}
+
+// ── WP-SEC1: agent control plane inside the workspace ────────────────────────────────
+//
+// Regression cover for the hole opened by widening `supervised_auto_approve` to the file_* tools.
+// In the user-cell pod shape HOME is `{workspace}/.home`, so the scheduler's job file and the
+// credential store resolve UNDER the workspace prefix. Without the control-plane denylist an
+// auto-approved `file_write` installs a durable self-retriggering cron job and rewrites provider
+// credentials with no prompt — reaching the exact persistence threat the cron approval gate exists
+// to stop, without using the cron tool at all.
+
+test "isResolvedPathAllowed rejects the scheduler job file inside the workspace" {
+    try std.testing.expect(!isResolvedPathAllowed(
+        std.testing.allocator,
+        "/workspace/.nullalis/cron.json",
+        "/workspace",
+        &.{},
+    ));
+}
+
+test "isResolvedPathAllowed rejects the credential store inside the workspace" {
+    try std.testing.expect(!isResolvedPathAllowed(
+        std.testing.allocator,
+        "/workspace/.nullalis/auth.json",
+        "/workspace",
+        &.{},
+    ));
+}
+
+test "isResolvedPathAllowed rejects the user-cell HOME tree" {
+    try std.testing.expect(!isResolvedPathAllowed(
+        std.testing.allocator,
+        "/workspace/.home/.nullalis/cron.json",
+        "/workspace",
+        &.{},
+    ));
+}
+
+test "isResolvedPathAllowed rejects the control-plane dir itself" {
+    try std.testing.expect(!isResolvedPathAllowed(
+        std.testing.allocator,
+        "/workspace/.nullalis",
+        "/workspace",
+        &.{},
+    ));
+}
+
+test "isResolvedPathAllowed rejects control plane even when listed in allowed_paths" {
+    // An operator-configured allowed_path must not be able to re-open the control plane.
+    try std.testing.expect(!isResolvedPathAllowed(
+        std.testing.allocator,
+        "/workspace/.nullalis/cron.json",
+        "/workspace",
+        &.{"/workspace/.nullalis"},
+    ));
+}
+
+test "isResolvedPathAllowed still allows ordinary workspace files" {
+    // The denylist must not turn into a general workspace lockout — this is what keeps supervised
+    // mode free of approval fatigue for normal file work.
+    try std.testing.expect(isResolvedPathAllowed(
+        std.testing.allocator,
+        "/workspace/notes/todo.md",
+        "/workspace",
+        &.{},
+    ));
+}
+
+test "isResolvedPathAllowed allows lookalike names that are not the control plane" {
+    // `.nullalis-notes` must not be caught by a naive startsWith.
+    try std.testing.expect(isResolvedPathAllowed(
+        std.testing.allocator,
+        "/workspace/.nullalis-notes/file.md",
+        "/workspace",
+        &.{},
+    ));
+    try std.testing.expect(isResolvedPathAllowed(
+        std.testing.allocator,
+        "/workspace/src/.homeward/x.txt",
+        "/workspace",
+        &.{},
+    ));
 }
