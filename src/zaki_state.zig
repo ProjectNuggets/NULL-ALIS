@@ -2383,8 +2383,9 @@ const ManagerImpl = struct {
     /// operator assertion that the complete, separately-applied schema is
     /// ready. Check catalogs rather than issuing a first write so a bad rollout
     /// fails at boot (before `deleteUser` can encounter a missing tombstone
-    /// table). Concurrent indexes must be live, ready, and valid; a same-name
-    /// INVALID residue is not readiness.
+    /// table). Concurrent indexes must be live, ready, and valid, and their
+    /// uniqueness/column semantics must still enforce the provenance boundary;
+    /// a same-name INVALID or weakened replacement is not readiness.
     fn meetingMemorySchemaReady(self: *Self) !bool {
         const relations_q = try self.buildQuery(
             "SELECT COALESCE(bool_and(" ++
@@ -2424,8 +2425,75 @@ const ManagerImpl = struct {
             return false;
         }
 
+        const index_semantics_q = try self.buildQuery(
+            "SELECT COALESCE(bool_and(COALESCE(" ++
+                "index_class.oid IS NOT NULL AND index_class.relkind = 'i' " ++
+                "AND i.indrelid = to_regclass(required.qualified_table) " ++
+                "AND i.indisunique = required.requires_unique " ++
+                "AND i.indisvalid AND i.indisready AND i.indislive " ++
+                "AND am.amname = required.access_method " ++
+                "AND i.indnkeyatts = cardinality(required.column_names) " ++
+                "AND i.indnatts = cardinality(required.column_names) " ++
+                "AND i.indpred IS NULL AND i.indexprs IS NULL " ++
+                "AND ARRAY(SELECT a.attname::text " ++
+                "FROM unnest(i.indkey::smallint[]) WITH ORDINALITY AS keyed(attnum, ordinal) " ++
+                "JOIN pg_catalog.pg_attribute AS a " ++
+                "ON a.attrelid = i.indrelid AND a.attnum = keyed.attnum " ++
+                "ORDER BY keyed.ordinal) = required.column_names, FALSE)), FALSE) " ++
+                "FROM (VALUES " ++
+                "('{schema}.idx_memory_source_links_exact_provenance', " ++
+                "'{schema}.memory_source_links', TRUE, 'btree', " ++
+                "ARRAY['user_id', 'write_origin', 'source_spoke', 'meeting_scope_digest', " ++
+                "'source_digest', 'candidate_digest']::text[]), " ++
+                "('{schema}.idx_memory_source_links_user_spoke_scope_digest', " ++
+                "'{schema}.memory_source_links', FALSE, 'btree', " ++
+                "ARRAY['user_id', 'source_spoke', 'meeting_scope_digest']::text[]), " ++
+                "('{schema}.idx_memory_source_links_memory', " ++
+                "'{schema}.memory_source_links', TRUE, 'btree', " ++
+                "ARRAY['user_id', 'memory_key']::text[]), " ++
+                "('{schema}.idx_meeting_memory_erasure_receipts_scope', " ++
+                "'{schema}.meeting_memory_erasure_receipts', TRUE, 'btree', " ++
+                "ARRAY['user_scope_digest', 'source_spoke', 'meeting_scope_digest']::text[]), " ++
+                "('{schema}.idx_meeting_memory_erasure_receipts_request_digest', " ++
+                "'{schema}.meeting_memory_erasure_receipts', TRUE, 'btree', " ++
+                "ARRAY['user_scope_digest', 'source_spoke', 'request_digest']::text[]), " ++
+                "('{schema}.idx_meeting_memory_erasure_receipts_retention', " ++
+                "'{schema}.meeting_memory_erasure_receipts', FALSE, 'btree', " ++
+                "ARRAY['erased_at']::text[]), " ++
+                "('{schema}.idx_meeting_memory_erasure_receipts_key_id', " ++
+                "'{schema}.meeting_memory_erasure_receipts', FALSE, 'btree', " ++
+                "ARRAY['receipt_key_id']::text[]), " ++
+                "('{schema}.idx_memory_events_user_memory_all', " ++
+                "'{schema}.memory_events', FALSE, 'btree', " ++
+                "ARRAY['user_id', 'memory_id']::text[]), " ++
+                "('{schema}.idx_memory_edges_source_all', " ++
+                "'{schema}.memory_edges', FALSE, 'btree', " ++
+                "ARRAY['user_id', 'source_key']::text[]), " ++
+                "('{schema}.idx_memory_edges_target_all', " ++
+                "'{schema}.memory_edges', FALSE, 'btree', " ++
+                "ARRAY['user_id', 'target_key']::text[]), " ++
+                "('{schema}.idx_memory_edges_episodes_all', " ++
+                "'{schema}.memory_edges', FALSE, 'gin', " ++
+                "ARRAY['episodes']::text[])) " ++
+                "AS required(qualified_name, qualified_table, requires_unique, access_method, column_names) " ++
+                "LEFT JOIN pg_catalog.pg_class AS index_class " ++
+                "ON index_class.oid = to_regclass(required.qualified_name) " ++
+                "LEFT JOIN pg_catalog.pg_index AS i ON i.indexrelid = index_class.oid " ++
+                "LEFT JOIN pg_catalog.pg_am AS am ON am.oid = index_class.relam",
+        );
+        defer self.allocator.free(index_semantics_q);
+        const index_semantics_result = try self.exec(index_semantics_q);
+        defer c.PQclear(index_semantics_result);
+        if (c.PQntuples(index_semantics_result) != 1 or
+            c.PQgetisnull(index_semantics_result, 0, 0) != 0 or
+            !std.mem.eql(u8, std.mem.span(c.PQgetvalue(index_semantics_result, 0, 0)), "t"))
+        {
+            return false;
+        }
+
         const triggers_q = try self.buildQuery(
-            "SELECT COALESCE(bool_and(t.oid IS NOT NULL AND t.tgenabled <> 'D'), FALSE) " ++
+            "SELECT COALESCE(bool_and(" ++
+                "t.oid IS NOT NULL AND t.tgenabled IN ('O', 'A')), FALSE) " ++
                 "FROM (VALUES " ++
                 "('{schema}.meeting_memory_crypto_state', 'meeting_memory_crypto_state_no_update_delete'), " ++
                 "('{schema}.meeting_memory_crypto_state', 'meeting_memory_crypto_state_no_truncate'), " ++
@@ -5267,10 +5335,11 @@ const ManagerImpl = struct {
 
             // Delete content-bearing audit events, working-memory references, and
             // graph edges only when they point at an exact target key/id. Legacy
-            // event payloads are not shape-stable: an exact key may occur as a
-            // nested string or object property name, so walk every JSONB node.
-            // This is deliberately equality-based; prefixes and other meetings'
-            // keys remain untouched.
+            // event payloads are not shape-stable: a target key may occur inside
+            // a nested prose string or object property name, so walk every JSONB
+            // node. Limit substring matching to canonical keys: they are
+            // fixed-width opaque identifiers, unlike legacy malformed keys
+            // that could otherwise over-match ordinary prose.
             {
                 const q = try self.buildQuery(
                     "WITH targets AS MATERIALIZED (" ++
@@ -5284,7 +5353,9 @@ const ManagerImpl = struct {
                         "OR EXISTS (SELECT 1 FROM jsonb_path_query(e.payload, '$.**') " ++
                         "AS carrier(value) JOIN targets AS t ON " ++
                         "(jsonb_typeof(carrier.value) = 'string' AND (" ++
-                        "carrier.value = to_jsonb(t.key) OR carrier.value = to_jsonb(t.id))) " ++
+                        "carrier.value = to_jsonb(t.key) OR carrier.value = to_jsonb(t.id) " ++
+                        "OR (t.key ~ '^meeting_ingest/[0-9a-f]{64}$' " ++
+                        "AND strpos(carrier.value #>> '{}', t.key) > 0))) " ++
                         "OR (jsonb_typeof(carrier.value) = 'object' " ++
                         "AND (carrier.value ? t.key OR carrier.value ? t.id))))",
                 );

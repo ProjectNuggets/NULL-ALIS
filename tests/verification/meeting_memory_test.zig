@@ -81,7 +81,7 @@ test "WP-15 live: default-off boots but explicit crypto rejects an unregistered 
     );
 }
 
-test "WP-15 live: explicit crypto rejects incomplete indexes and boots when complete" {
+test "WP-15 live: explicit crypto rejects incomplete or weakened schema and boots when complete" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -140,6 +140,53 @@ test "WP-15 live: explicit crypto rejects incomplete indexes and boots when comp
         .{schema},
     );
     try execPostgresSql(allocator, test_url, restore_index_sql, true);
+
+    // A same-name provenance index with the right columns but no uniqueness
+    // no longer preserves the idempotency boundary. Catalog readiness must not
+    // accept it merely because all migration object names exist.
+    const weaken_provenance_index_sql = try std.fmt.allocPrint(
+        allocator,
+        "DROP INDEX {s}.idx_memory_source_links_exact_provenance; " ++
+            "CREATE INDEX idx_memory_source_links_exact_provenance ON {s}.memory_source_links " ++
+            "(user_id, write_origin, source_spoke, meeting_scope_digest, source_digest, candidate_digest)",
+        .{ schema, schema },
+    );
+    try execPostgresSql(allocator, test_url, weaken_provenance_index_sql, true);
+    try std.testing.expectError(
+        error.MeetingMemorySchemaUnavailable,
+        nullalis.zaki_state.Manager.init(allocator, enabled_cfg),
+    );
+
+    const restore_provenance_index_sql = try std.fmt.allocPrint(
+        allocator,
+        "DROP INDEX {s}.idx_memory_source_links_exact_provenance; " ++
+            "CREATE UNIQUE INDEX idx_memory_source_links_exact_provenance ON {s}.memory_source_links " ++
+            "(user_id, write_origin, source_spoke, meeting_scope_digest, source_digest, candidate_digest)",
+        .{ schema, schema },
+    );
+    try execPostgresSql(allocator, test_url, restore_provenance_index_sql, true);
+
+    // `ENABLE REPLICA` leaves the guard dormant for ordinary runtime writes.
+    // Only origin/always trigger modes enforce this deployment's immutability.
+    const replica_trigger_sql = try std.fmt.allocPrint(
+        allocator,
+        "ALTER TABLE {s}.meeting_memory_crypto_state ENABLE REPLICA TRIGGER " ++
+            "meeting_memory_crypto_state_no_update_delete",
+        .{schema},
+    );
+    try execPostgresSql(allocator, test_url, replica_trigger_sql, true);
+    try std.testing.expectError(
+        error.MeetingMemorySchemaUnavailable,
+        nullalis.zaki_state.Manager.init(allocator, enabled_cfg),
+    );
+
+    const restore_trigger_sql = try std.fmt.allocPrint(
+        allocator,
+        "ALTER TABLE {s}.meeting_memory_crypto_state ENABLE TRIGGER " ++
+            "meeting_memory_crypto_state_no_update_delete",
+        .{schema},
+    );
+    try execPostgresSql(allocator, test_url, restore_trigger_sql, true);
 
     var enabled = try nullalis.zaki_state.Manager.init(allocator, enabled_cfg);
     defer enabled.deinit();
@@ -1129,6 +1176,7 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
             "('wp15-meeting-timeline-event', {d}, NULL, 'traversal', jsonb_build_object('entry_keys', jsonb_build_array('generic-unrelated', '{s}'))), " ++
             "('wp15-meeting-nested-value-event', {d}, NULL, 'legacy', jsonb_build_object('nested', jsonb_build_array(jsonb_build_object('value', '{s}')))), " ++
             "('wp15-meeting-nested-property-event', {d}, NULL, 'legacy', jsonb_build_object('nested', jsonb_build_object('{s}', true))), " ++
+            "('wp15-meeting-embedded-string-event', {d}, NULL, 'legacy', jsonb_build_object('note', 'legacy prose carries {s} inline')), " ++
             "('wp15-unrelated-nested-event', {d}, NULL, 'legacy', jsonb_build_object('nested', jsonb_build_array(jsonb_build_object('value', '{s}')))), " ++
             "('wp15-unrelated-traversal-event', {d}, NULL, 'traversal', jsonb_build_object('node_keys', jsonb_build_array('generic-unrelated', 'generic-identical'))); " ++
             "INSERT INTO {s}.working_memory (user_id, session_id, slot_id, slot_type, content, source_key, importance, pinned) " ++
@@ -1142,6 +1190,8 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
             user_a,
             first.memoryKey(),
             user_a,
+            user_a,
+            first.memoryKey(),
             user_a,
             first.memoryKey(),
             user_a,
@@ -1286,7 +1336,7 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const erased = try mgr.eraseMeetingMemories(erase_request);
     try std.testing.expectEqual(1 + cardinality_targets, erased.manifest.counts.memory_source_links_deleted);
     try std.testing.expectEqual(1 + cardinality_targets, erased.manifest.counts.memories_deleted);
-    try std.testing.expectEqual(6 + cardinality_targets, erased.manifest.counts.memory_events_deleted);
+    try std.testing.expectEqual(7 + cardinality_targets, erased.manifest.counts.memory_events_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_embeddings_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_vectors_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_entities_deleted);
@@ -1348,7 +1398,7 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
             "IF EXISTS (SELECT 1 FROM {s}.memory_events WHERE user_id = {d} " ++
             "AND id IN ('wp15-meeting-graph-event', 'wp15-meeting-timeline-event', " ++
             "'wp15-meeting-nested-value-event', 'wp15-meeting-nested-property-event', " ++
-            "'wp15-meeting-memory-id-event')) " ++
+            "'wp15-meeting-embedded-string-event', 'wp15-meeting-memory-id-event')) " ++
             "THEN RAISE EXCEPTION 'meeting traversal carrier survived'; END IF; " ++
             "IF NOT EXISTS (SELECT 1 FROM {s}.memory_events WHERE user_id = {d} " ++
             "AND id IN ('wp15-unrelated-traversal-event', 'wp15-unrelated-nested-event') " ++
