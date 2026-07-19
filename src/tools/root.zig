@@ -2185,10 +2185,15 @@ pub const RuntimeTurnContext = struct {
     session_key: ?[]const u8 = null,
     provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
-    /// Present only on a foreground turn whose runtime is prepared to expose
+    /// Present only on a turn whose runtime is prepared to expose
     /// `minutes_read`. Null fails closed inside the tool even if registration
     /// or dispatch policy is accidentally bypassed.
     minutes_read_state: ?*MinutesReadTurnState = null,
+    /// Explicit daemon-to-session grant for the owner-scoped, non-delivery
+    /// cron lane. An origin enum alone is not authorization: task-ledger and
+    /// other internal callers may also use background origins. The session
+    /// installs this only after matching an authoritative tenant identity.
+    minutes_background_read_authorized: bool = false,
     /// Per-session billing + capability state. Default construction gives
     /// "pro active unlimited" so existing tests + un-plumbed call paths
     /// keep working. S2.1 (BFF provision response extension) installs the
@@ -2338,6 +2343,17 @@ pub fn isBackgroundTurnOrigin(origin: TurnOrigin) bool {
     };
 }
 
+/// Defense-in-depth predicate shared by the Agent tool surface and tool
+/// preflight. Only the daemon-owned scheduler lane can carry the explicit
+/// grant; heartbeat, wake, proactive, foreground, and generic scheduler
+/// callers remain closed.
+pub fn isMinutesBackgroundReadAuthorized(ctx: RuntimeTurnContext) bool {
+    return ctx.origin == .scheduler and
+        ctx.entry_kind == .daemon and
+        ctx.minutes_background_read_authorized and
+        ctx.minutes_read_state != null;
+}
+
 pub fn effectiveStateBackend(config: *const @import("../config.zig").Config, tenant_ctx: ToolTenantContext) []const u8 {
     if (!std.mem.eql(u8, config.state.backend, "postgres")) return "file";
     if (!build_options.enable_postgres) return "file";
@@ -2478,10 +2494,11 @@ pub fn toolBlockedForCurrentTurnWithMeta(
     if (!isBackgroundTurnOrigin(turn_ctx.origin)) return null;
     const policy = backgroundPolicyForOrigin(turn_ctx.origin);
 
-    // Transcript metadata/content is user-request-only even though the tool is
-    // read-only. Heartbeat/scheduler/wake/proactive lanes must not read or
-    // ingest meeting content without an active foreground request.
+    // Transcript metadata/content is denied to generic background turns even
+    // though the tool is read-only. The sole exception is the explicit,
+    // owner-scoped, daemon scheduler grant installed by SessionManager.
     if (std.mem.eql(u8, tool_name, minutes_read.MinutesReadTool.tool_name)) {
+        if (isMinutesBackgroundReadAuthorized(turn_ctx)) return null;
         return "Minutes reads are disabled for background turns";
     }
 
@@ -3162,12 +3179,37 @@ test "all background origins allow web search" {
     try std.testing.expect(toolBlockedForCurrentTurn("web_search", args.value.object) == null);
 }
 
-test "minutes_read is foreground-only despite read-only metadata" {
+test "minutes_read permits only an explicitly authorized scheduler background turn" {
     const args = try parseTestArgs("{\"action\":\"index\"}");
     defer args.deinit();
     defer clearTurnContext();
 
-    const background_origins = [_]TurnOrigin{ .heartbeat, .scheduler, .wake, .proactive };
+    var minutes_state = MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
+
+    setTurnContext(.{
+        .origin = .scheduler,
+        .entry_kind = .daemon,
+        .minutes_read_state = &minutes_state,
+        .minutes_background_read_authorized = true,
+    });
+    try std.testing.expect(toolBlockedForCurrentTurn("minutes_read", args.value.object) == null);
+
+    setTurnContext(.{
+        .origin = .scheduler,
+        .entry_kind = .daemon,
+        .minutes_read_state = &minutes_state,
+    });
+    try std.testing.expect(toolBlockedForCurrentTurn("minutes_read", args.value.object) != null);
+
+    setTurnContext(.{
+        .origin = .scheduler,
+        .minutes_read_state = &minutes_state,
+        .minutes_background_read_authorized = true,
+    });
+    try std.testing.expect(toolBlockedForCurrentTurn("minutes_read", args.value.object) != null);
+
+    const background_origins = [_]TurnOrigin{ .heartbeat, .wake, .proactive };
     for (background_origins) |origin| {
         setTurnContext(.{ .origin = origin });
         const blocked = toolBlockedForCurrentTurn("minutes_read", args.value.object) orelse return error.TestUnexpectedResult;
