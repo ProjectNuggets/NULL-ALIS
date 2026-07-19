@@ -3,6 +3,7 @@ const compaction = @import("compaction.zig");
 const context_cache = @import("context_cache.zig");
 const context_estimator = @import("context_estimator.zig");
 const model_capabilities = @import("model_capabilities.zig");
+const memory_root = @import("../memory/root.zig");
 const prompt = @import("prompt.zig");
 const providers = @import("../providers/root.zig");
 const tool_surface = @import("tool_surface.zig");
@@ -661,6 +662,11 @@ pub const scaffold_internal_tokens = [_][]const u8{
     "Layer 0",
     "Layer 1",
     "Layer 2",
+    "Layer 3",
+    "Layer 4",
+    "Layer 5",
+    "Layer 6",
+    "Layer 7",
     "Auto-promoted",
     "Auto-promotion",
     "Semantic memory",
@@ -670,6 +676,16 @@ pub const scaffold_internal_tokens = [_][]const u8{
     "Memory Link",
     "Link type",
     "Link Type",
+    "Brain graph",
+    "Canonical memory",
+    "Dream cycle",
+    "File read",
+    "Knowledge graph",
+    "Memory recall",
+    "Memory timeline",
+    "Tool routing",
+    "Vector index",
+    "Web search",
 };
 
 /// Brain-leak denylist of scaffold section TITLES (the bare `## <Title>` text,
@@ -724,10 +740,12 @@ comptime {
 }
 
 /// Combined entity-name denylist for the brain-leak fixes: scaffold section
-/// titles + scaffold-body terms. Compared case-insensitively and after
-/// whitespace-normalization by `isScaffoldEntityName`. This is the single
-/// list Fix A (extraction write boundary) and Fix C (C0 purge) consume.
-pub const scaffold_entity_names = scaffold_title_names ++ scaffold_internal_tokens;
+/// titles + scaffold-body terms + the canonical memory-link vocabulary.
+/// Compared case-insensitively and after whitespace-normalization by
+/// `isScaffoldEntityName`. This is the single list Fix A (extraction write
+/// boundary) and Fix C (C0 purge) consume. Importing `ALL_LINK_TYPES` keeps
+/// prompt and persistence policy in lockstep when the vocabulary changes.
+pub const scaffold_entity_names = scaffold_title_names ++ scaffold_internal_tokens ++ memory_root.ALL_LINK_TYPES;
 
 /// Whitespace-normalize `s` in place into `buf` (collapse internal runs of
 /// ASCII whitespace to a single space, trim ends, lowercase ASCII). Returns
@@ -815,7 +833,12 @@ test "isScaffoldEntityName: scaffold titles + body terms match (case/whitespace-
     try std.testing.expect(isScaffoldEntityName("Working memory"));
     try std.testing.expect(isScaffoldEntityName("Distillation extraction"));
     try std.testing.expect(isScaffoldEntityName("Layer 0"));
+    try std.testing.expect(isScaffoldEntityName("Layer 7"));
+    try std.testing.expect(isScaffoldEntityName("Knowledge graph"));
     try std.testing.expect(isScaffoldEntityName("Auto-promoted"));
+    for (memory_root.ALL_LINK_TYPES) |link_type| {
+        try std.testing.expect(isScaffoldEntityName(link_type));
+    }
 }
 
 test "isScaffoldEntityName: legitimate facts are NOT over-filtered" {
@@ -833,6 +856,7 @@ test "isScaffoldEntityName: legitimate facts are NOT over-filtered" {
     // must NOT trip the filter.
     try std.testing.expect(!isScaffoldEntityName("Safety team"));
     try std.testing.expect(!isScaffoldEntityName("Brain Architecture course")); // longer than the entry
+    try std.testing.expect(!isScaffoldEntityName("MEMORY.md"));
     try std.testing.expect(!isScaffoldEntityName("")); // empty
 }
 

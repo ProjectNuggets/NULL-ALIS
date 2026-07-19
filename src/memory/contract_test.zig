@@ -102,7 +102,19 @@ test "memory contract: scaffold entity names are denied, near-misses are not" {
     try std.testing.expect(context_builder.isScaffoldEntityName("Brain Architecture"));
     try std.testing.expect(context_builder.isScaffoldEntityName("Memory Link Types"));
     try std.testing.expect(context_builder.isScaffoldEntityName("  working   memory ")); // normalized match
+    for (memory_root.ALL_LINK_TYPES) |link_type| {
+        try std.testing.expect(context_builder.isScaffoldEntityName(link_type));
+    }
+    const extended_scaffold_names = [_][]const u8{
+        "Layer 3",       "Layer 4",          "Layer 5",      "Layer 6",      "Layer 7",
+        "Brain graph",   "Canonical memory", "Dream cycle",  "File read",    "Knowledge graph",
+        "Memory recall", "Memory timeline",  "Tool routing", "Vector index", "Web search",
+    };
+    for (extended_scaffold_names) |name| {
+        try std.testing.expect(context_builder.isScaffoldEntityName(name));
+    }
     try std.testing.expect(!context_builder.isScaffoldEntityName("Brain Architecture course"));
+    try std.testing.expect(!context_builder.isScaffoldEntityName("MEMORY.md"));
     try std.testing.expect(!context_builder.isScaffoldEntityName("Acme Corp"));
 }
 

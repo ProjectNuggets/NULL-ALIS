@@ -44,7 +44,7 @@ enforced in extraction-builder tests inside `src/agent/extraction/runner.zig`.)
 | `.tool` result from `memory_doctor`, `memory_maintain`, `brain_graph`, `context_snapshot`, `trace_query`, `runtime_info`, `memory_list`, `memory_timeline`, `transcript_read` [E] | bookkeeping | dropped by exact tool identity |
 | `.tool` result from data tools (`web_search`, `web_fetch`, `file_read`, …) [E] | knowledge (candidate) | extracted |
 | `.tool` result, `name == null` [E] | unknown | fail-open: extracted |
-| Entity named in `scaffold_entity_names` at persist boundary | bookkeeping | write rejected (denylist backstop) |
+| Entity named in `scaffold_entity_names` at persist boundary | bookkeeping | write rejected (denylist backstop); the exact normalized set combines stable scaffold titles, curated Brain-Architecture body terms, and every canonical memory link type |
 | Content containing a runtime-owned assistant scaffold fence | bookkeeping | `containsAssistantScaffold` rejects the entire write before persistence; `memory_store` returns a user-safe failure and the Postgres manager returns `error.AssistantScaffoldRejected` on simple + metadata paths |
 | `memory_store` (inline path) with a scaffold-entity, system-managed, default-hidden-bookkeeping, or >255-byte key | bookkeeping | tool call rejected with redirect message (`inlineKeyGuard`); the unified-triple path is exempt — it derives its own `extracted_<hash>` key and ignores the caller's |
 | Keys `summary_latest/ timeline_summary/ session_summary/ summary_fallback/` | derived | not embedded (`shouldEmbedMemoryEntry`=false), semantic-bookkeeping (excluded from fact recall), hidden from the /brain view (`isBrainVisibleKey`=false) but NOT default-hidden — stays injectable for warm-start (P4) |
@@ -63,7 +63,7 @@ are deliberately omitted: they rot on unrelated edits; symbols survive refactors
 
 - Role filter (keystone): `src/agent/extraction/runner.zig` `buildEpisodeTranscript` / `buildTranscript`
 - Tool-identity filter: `runner.zig` `internal_extraction_tool_names` (pub = test-only surface) + `isInternalExtractionToolName`
-- Entity denylist: `src/agent/context_builder.zig` `scaffold_entity_names` (comptime drift-guarded vs `stable_prompt_markers`; normalized forms precomputed at comptime)
+- Entity denylist: `src/agent/context_builder.zig` `scaffold_entity_names` (titles are comptime drift-guarded vs `stable_prompt_markers`; link names derive from `src/memory/root.zig` `ALL_LINK_TYPES`; normalized forms are precomputed at comptime)
 - Key predicates: `src/memory/root.zig` — `isInternalMemoryKey`, `isContinuityArtifactKey`, `isContinuitySummaryKey`, `isDefaultHiddenMemoryKey`, `isBrainVisibleKey`, `BRAIN_HIDDEN_PREFIXES` / `BRAIN_HIDDEN_EXACT_KEYS`, `isSemanticBookkeepingKey`, `shouldEmbedMemoryEntry`, `isTombstoneKey`, `isAppendOnlyMemoryKey`, `isSystemManagedMemoryKey`, `isMutableMemoryEntry`, `isEditableMemoryEntry`
 - Scaffold-content predicate: `src/memory/root.zig` `containsAssistantScaffold`; enforced by the shared `Memory.store` / `storeWithMetadata` facade, agent-facing store/edit/compose tools, and every Postgres manager path that can accept caller-authored replacement content before database work
 - Existing-row cleanup: versioned migration `src/migrations/0010_brain_scaffold_purge.sql` records hash-only `memory_events`, removes explicitly fenced memories plus exact scaffold entities and their tenant-scoped edges/default pgvector rows, and leaves ordinary prose untouched
