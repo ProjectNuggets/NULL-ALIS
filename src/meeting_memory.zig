@@ -6,6 +6,7 @@ pub const write_origin = "meeting_ingest";
 pub const source_spoke = "minutes";
 pub const memory_key_prefix = "meeting_ingest/";
 pub const memory_key_len = memory_key_prefix.len + 64;
+pub const memory_key_regex = "^meeting_ingest/[0-9a-f]{64}$";
 pub const sha256_prefix = "sha256=";
 pub const sha256_text_len = sha256_prefix.len + 64;
 pub const ed25519_prefix = "ed25519=";
@@ -785,6 +786,32 @@ fn lowerHexNibble(byte: u8) ?u8 {
     return null;
 }
 
+/// Recognize only keys that the dedicated Minutes writer can actually derive.
+/// A prefix match would reserve arbitrary pre-existing user keys such as
+/// `meeting_ingest/notes` even while the dormant feature is disabled.
+pub fn isCanonicalMemoryKey(value: []const u8) bool {
+    if (value.len != memory_key_len or
+        !std.mem.eql(u8, value[0..memory_key_prefix.len], memory_key_prefix)) return false;
+    for (value[memory_key_prefix.len..]) |byte| {
+        if (lowerHexNibble(byte) == null) return false;
+    }
+    return true;
+}
+
+/// Detect a canonical key carried inside a larger string. Traversal payloads
+/// are durable JSON and legacy callers may embed a key in prose or in a nested
+/// property name, so checking only whether the whole string starts with the
+/// key would leave an erasure carrier behind.
+pub fn containsCanonicalMemoryKey(value: []const u8) bool {
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, value, cursor, memory_key_prefix)) |start| {
+        if (value.len - start >= memory_key_len and
+            isCanonicalMemoryKey(value[start .. start + memory_key_len])) return true;
+        cursor = start + memory_key_prefix.len;
+    }
+    return false;
+}
+
 fn isCanonicalSha256Text(value: []const u8) bool {
     if (value.len != sha256_text_len or
         !std.mem.eql(u8, value[0..sha256_prefix.len], sha256_prefix)) return false;
@@ -934,6 +961,17 @@ test "prepared meeting memory fixes provenance and derives a bounded key" {
     try std.testing.expectEqualStrings("Ship the staged pilot", prepared.candidate.text());
     try std.testing.expectEqualStrings(memory_key_prefix, prepared.provenance.identity.memoryKey()[0..memory_key_prefix.len]);
     try std.testing.expectEqual(@as(usize, memory_key_len), prepared.provenance.identity.memoryKey().len);
+}
+
+test "meeting memory key recognition is canonical and finds nested carriers" {
+    const key = "meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    try std.testing.expect(isCanonicalMemoryKey(key));
+    try std.testing.expect(containsCanonicalMemoryKey(key));
+    try std.testing.expect(containsCanonicalMemoryKey("before meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef after"));
+    try std.testing.expect(!isCanonicalMemoryKey("meeting_ingest/notes"));
+    try std.testing.expect(!isCanonicalMemoryKey("meeting_ingest/0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"));
+    try std.testing.expect(!isCanonicalMemoryKey("meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde"));
+    try std.testing.expect(!containsCanonicalMemoryKey("before meeting_ingest/notes after"));
 }
 
 test "source candidate and consent fields reject blank oversized and NUL input" {

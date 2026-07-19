@@ -1365,11 +1365,18 @@ pub fn isContinuitySummaryKey(key: []const u8) bool {
 
 /// Meeting-derived Brain rows are visible to the user and keyword recall, but
 /// only the dedicated, separately-consented `meeting_ingest` writer/eraser may
-/// mutate them. Keeping the prefix in the meeting contract module makes key
-/// derivation, generic-tool protection, and vector exclusion share one source
-/// of truth.
+/// mutate them. Recognition is deliberately exact: reserving every string with
+/// the prefix would take ownership of unrelated legacy/user keys even when the
+/// dormant feature is disabled.
 pub fn isMeetingDerivedMemoryKey(key: []const u8) bool {
-    return std.mem.startsWith(u8, key, meeting_memory.memory_key_prefix);
+    return meeting_memory.isCanonicalMemoryKey(key);
+}
+
+/// Traversal/event payloads may carry a canonical key inside a larger string.
+/// The exact eraser scans durable JSON carriers, so reject those embedded
+/// occurrences before persistence as well as standalone key strings.
+pub fn containsMeetingDerivedMemoryKey(value: []const u8) bool {
+    return meeting_memory.containsCanonicalMemoryKey(value);
 }
 
 pub fn isDefaultHiddenMemoryKey(key: []const u8) bool {
@@ -4327,7 +4334,8 @@ test "shouldEmbedMemoryEntry skips bookkeeping artifacts and oversize content" {
 test "WP-15 meeting-derived keys are protected visible and non-embeddable" {
     const key = "meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     try std.testing.expect(isMeetingDerivedMemoryKey(key));
-    try std.testing.expect(isMeetingDerivedMemoryKey("meeting_ingest/reserved-even-before-validation"));
+    try std.testing.expect(!isMeetingDerivedMemoryKey("meeting_ingest/reserved-even-before-validation"));
+    try std.testing.expect(containsMeetingDerivedMemoryKey("nested:meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
     try std.testing.expect(isSystemManagedMemoryKey(key));
     try std.testing.expect(!isEditableMemoryEntry(key, .{ .custom = "decision" }));
     try std.testing.expect(isBrainVisibleKey(key));

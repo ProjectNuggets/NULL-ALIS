@@ -111,7 +111,7 @@ pub const VectorStore = struct {
     }
 
     pub fn upsertScoped(self: VectorStore, scope_user_id: ?i64, key: []const u8, embedding: []const f32) !void {
-        if (std.mem.startsWith(u8, key, meeting_memory.memory_key_prefix)) {
+        if (meeting_memory.isCanonicalMemoryKey(key)) {
             return error.MeetingDerivedMemoryEmbeddingForbidden;
         }
         return self.vtable.upsert(self.ptr, scope_user_id, key, embedding);
@@ -579,9 +579,14 @@ test "VectorStore rejects meeting-derived upserts before the backend boundary" {
 
     try std.testing.expectError(
         error.MeetingDerivedMemoryEmbeddingForbidden,
-        store.upsertScoped(42, "meeting_ingest/not-yet-validated", &[_]f32{ 1.0, 0.0 }),
+        store.upsertScoped(42, "meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", &[_]f32{ 1.0, 0.0 }),
     );
     try std.testing.expectEqual(@as(usize, 0), backend.upsert_calls);
+
+    // A malformed/legacy prefix occupant is generic and must not have its
+    // vector namespace silently reserved while Minutes is dormant.
+    try store.upsertScoped(42, "meeting_ingest/legacy-user-key", &[_]f32{ 1.0, 0.0 });
+    try std.testing.expectEqual(@as(usize, 1), backend.upsert_calls);
 }
 
 test "init with in-memory sqlite" {

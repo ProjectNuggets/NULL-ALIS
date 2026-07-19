@@ -19274,6 +19274,10 @@ const BRAIN_COMPOSE_MAX_REFERENCES: usize = 50;
 const BRAIN_COMPOSE_MAX_REF_KEY_LEN: usize = 256;
 const BRAIN_COMPOSE_KEY_PREFIX = "compose:";
 
+fn brainComposeReferenceAllowed(key: []const u8) bool {
+    return !memory_mod.isMeetingDerivedMemoryKey(key);
+}
+
 fn handleBrainCompose(
     allocator: std.mem.Allocator,
     method: []const u8,
@@ -19360,6 +19364,9 @@ fn handleBrainCompose(
         };
         if (k.len == 0 or k.len > BRAIN_COMPOSE_MAX_REF_KEY_LEN) {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"reference_key_invalid\"}" };
+        }
+        if (!brainComposeReferenceAllowed(k)) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"meeting_reference_not_composable\",\"detail\":\"meeting-derived references require transitive provenance and erasure before they can be composed\"}" };
         }
         if (ref_seen.contains(k)) {
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"duplicate_reference\"}" };
@@ -37702,9 +37709,9 @@ test "handleBrainGraph rejects malformed max_nodes" {
 
 test "brain traversal payload: graph excludes meeting-ingest keys and keeps unrelated keys" {
     const nodes = [_]BrainNode{
-        .{ .key = "meeting_ingest/fixture/meeting-1/summary", .kind = "meeting", .session_id = null, .created_at = 1, .summary = "", .valid_to = null },
+        .{ .key = "meeting_ingest/0000000000000000000000000000000000000000000000000000000000000000", .kind = "meeting", .session_id = null, .created_at = 1, .summary = "", .valid_to = null },
         .{ .key = "user_preferences", .kind = "core", .session_id = null, .created_at = 2, .summary = "", .valid_to = null },
-        .{ .key = "meeting_ingest/fixture/meeting-1/action/0", .kind = "meeting", .session_id = null, .created_at = 3, .summary = "", .valid_to = null },
+        .{ .key = "meeting_ingest/1111111111111111111111111111111111111111111111111111111111111111", .kind = "meeting", .session_id = null, .created_at = 3, .summary = "", .valid_to = null },
         .{ .key = "meeting_ingestion/user-key", .kind = "core", .session_id = null, .created_at = 4, .summary = "", .valid_to = null },
         .{ .key = "durable_fact/123/0", .kind = "core", .session_id = null, .created_at = 5, .summary = "", .valid_to = null },
     };
@@ -37796,9 +37803,9 @@ test "handleBrainTimeline rejects invalid user_id" {
 
 test "brain traversal payload: timeline excludes meeting-ingest keys and keeps unrelated keys" {
     const entries = [_]memory_mod.MemoryEntry{
-        .{ .id = "1", .key = "meeting_ingest/fixture/meeting-1/summary", .content = "", .category = .core, .timestamp = "2026-07-16T10:00:00Z" },
+        .{ .id = "1", .key = "meeting_ingest/0000000000000000000000000000000000000000000000000000000000000000", .content = "", .category = .core, .timestamp = "2026-07-16T10:00:00Z" },
         .{ .id = "2", .key = "user_preferences", .content = "", .category = .core, .timestamp = "2026-07-16T10:01:00Z" },
-        .{ .id = "3", .key = "meeting_ingest/fixture/meeting-1/action/0", .content = "", .category = .core, .timestamp = "2026-07-16T10:02:00Z" },
+        .{ .id = "3", .key = "meeting_ingest/1111111111111111111111111111111111111111111111111111111111111111", .content = "", .category = .core, .timestamp = "2026-07-16T10:02:00Z" },
         .{ .id = "4", .key = "meeting_ingestion/user-key", .content = "", .category = .core, .timestamp = "2026-07-16T10:03:00Z" },
         .{ .id = "5", .key = "durable_fact/123/0", .content = "", .category = .core, .timestamp = "2026-07-16T10:04:00Z" },
     };
@@ -37986,6 +37993,14 @@ test "handleBrainCompose rejects invalid user_id" {
     var dummy_state: GatewayState = undefined;
     const resp = handleBrainCompose(std.testing.allocator, "POST", "abc", "POST /api/v1/users/abc/brain/compose HTTP/1.1\r\n\r\n", &dummy_state);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+test "brain compose reference policy rejects only canonical meeting keys" {
+    try std.testing.expect(!brainComposeReferenceAllowed(
+        "meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    ));
+    try std.testing.expect(brainComposeReferenceAllowed("meeting_ingest/legacy-user-key"));
+    try std.testing.expect(brainComposeReferenceAllowed("meeting_ingestion/near-miss"));
 }
 
 // ── /brain review-fix tests ──────────────────────────────────────

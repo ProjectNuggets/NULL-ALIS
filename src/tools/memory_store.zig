@@ -689,7 +689,12 @@ test "memory_store contract guard: inlineKeyGuard families + storable keys" {
     // derives its own extracted_<hash> key.
     try std.testing.expect(MemoryStoreTool.inlineKeyGuard("Brain Architecture") != null);
     try std.testing.expect(MemoryStoreTool.inlineKeyGuard("summary_latest/x") != null);
-    try std.testing.expect(MemoryStoreTool.inlineKeyGuard("meeting_ingest/forged") != null);
+    // Malformed/legacy prefix occupants are ordinary user keys; only the
+    // canonical digest shape is reserved for the dormant Minutes writer.
+    try std.testing.expect(MemoryStoreTool.inlineKeyGuard("meeting_ingest/forged") == null);
+    try std.testing.expect(MemoryStoreTool.inlineKeyGuard(
+        "meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    ) != null);
     try std.testing.expect(MemoryStoreTool.inlineKeyGuard("__tombstone__/x") != null);
     try std.testing.expect(MemoryStoreTool.inlineKeyGuard("audit_shell/2026") != null);
     // Storable: plain user keys AND the dream cycle's dream_log/ namespace.

@@ -104,6 +104,37 @@ fn assertGenericMemoryMutationAllowed(key: []const u8) !void {
     }
 }
 
+/// A generic compose row has no transitive Minutes provenance and is therefore
+/// outside the exact meeting erasure sweep. Until that provenance closure
+/// exists, the shared metadata writeback boundary must refuse a direct Minutes
+/// root even if a caller bypasses both public compose surfaces.
+fn assertGenericComposeMetadataAllowed(
+    allocator: std.mem.Allocator,
+    metadata_json: []const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, metadata_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return,
+    };
+    const references_value = object.get("references") orelse return;
+    const references = switch (references_value) {
+        .array => |value| value.items,
+        else => return,
+    };
+    for (references) |reference| {
+        const key = switch (reference) {
+            .string => |value| value,
+            else => continue,
+        };
+        try assertGenericMemoryMutationAllowed(key);
+    }
+}
+
 fn assertGenericCommunityAssignmentsAllowed(
     assignments: []const memory_root.CommunityAssignment,
 ) !void {
@@ -114,19 +145,40 @@ fn assertGenericCommunityAssignmentsAllowed(
 
 fn assertTraversalValueHasNoMeetingKeys(value: std.json.Value) !void {
     switch (value) {
-        .string => |text_value| try assertGenericMemoryMutationAllowed(text_value),
+        .string => |text_value| {
+            if (memory_root.containsMeetingDerivedMemoryKey(text_value)) {
+                return error.MeetingMemoryRequiresDedicatedMutation;
+            }
+        },
         .array => |items| for (items.items) |item| {
             try assertTraversalValueHasNoMeetingKeys(item);
         },
         .object => |object| {
             var iterator = object.iterator();
             while (iterator.next()) |entry| {
-                try assertGenericMemoryMutationAllowed(entry.key_ptr.*);
+                if (memory_root.containsMeetingDerivedMemoryKey(entry.key_ptr.*)) {
+                    return error.MeetingMemoryRequiresDedicatedMutation;
+                }
                 try assertTraversalValueHasNoMeetingKeys(entry.value_ptr.*);
             }
         },
         else => {},
     }
+}
+
+test "WP-15 generic compose metadata refuses direct meeting provenance" {
+    const meeting_key = "meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const metadata =
+        "{\"synthesized_by\":\"agent\",\"references\":[\"generic\",\"" ++
+        meeting_key ++ "\"]}";
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        assertGenericComposeMetadataAllowed(std.testing.allocator, metadata),
+    );
+    try assertGenericComposeMetadataAllowed(
+        std.testing.allocator,
+        "{\"references\":[\"meeting_ingest/legacy-user-key\",\"generic\"]}",
+    );
 }
 
 fn assertTraversalPayloadAllowed(
@@ -2326,6 +2378,76 @@ const ManagerImpl = struct {
         }
     }
 
+    /// The Minutes migrations are intentionally not registered while the
+    /// feature is dormant. Explicit crypto activation is therefore also an
+    /// operator assertion that the complete, separately-applied schema is
+    /// ready. Check catalogs rather than issuing a first write so a bad rollout
+    /// fails at boot (before `deleteUser` can encounter a missing tombstone
+    /// table). Concurrent indexes must be live, ready, and valid; a same-name
+    /// INVALID residue is not readiness.
+    fn meetingMemorySchemaReady(self: *Self) !bool {
+        const relations_q = try self.buildQuery(
+            "SELECT COALESCE(bool_and(" ++
+                "c.oid IS NOT NULL AND ((required.kind = 'table' AND c.relkind IN ('r', 'p')) " ++
+                "OR (required.kind = 'index' AND c.relkind = 'i' " ++
+                "AND COALESCE(i.indisvalid, FALSE) AND COALESCE(i.indisready, FALSE) " ++
+                "AND COALESCE(i.indislive, FALSE)))), FALSE) " ++
+                "FROM (VALUES " ++
+                "('{schema}.meeting_memory_crypto_state', 'table'), " ++
+                "('{schema}.memory_source_links', 'table'), " ++
+                "('{schema}.meeting_memory_erasure_tombstones', 'table'), " ++
+                "('{schema}.meeting_memory_account_erasure_tombstones', 'table'), " ++
+                "('{schema}.meeting_memory_erasure_receipts', 'table'), " ++
+                "('{schema}.idx_memory_source_links_exact_provenance', 'index'), " ++
+                "('{schema}.idx_memory_source_links_user_spoke_scope_digest', 'index'), " ++
+                "('{schema}.idx_memory_source_links_memory', 'index'), " ++
+                "('{schema}.idx_meeting_memory_erasure_receipts_scope', 'index'), " ++
+                "('{schema}.idx_meeting_memory_erasure_receipts_request_digest', 'index'), " ++
+                "('{schema}.idx_meeting_memory_erasure_receipts_retention', 'index'), " ++
+                "('{schema}.idx_meeting_memory_erasure_receipts_key_id', 'index'), " ++
+                "('{schema}.idx_memory_events_user_memory_all', 'index'), " ++
+                "('{schema}.idx_memory_edges_source_all', 'index'), " ++
+                "('{schema}.idx_memory_edges_target_all', 'index'), " ++
+                "('{schema}.idx_memory_edges_episodes_all', 'index')) " ++
+                "AS required(qualified_name, kind) " ++
+                "LEFT JOIN pg_catalog.pg_class AS c " ++
+                "ON c.oid = to_regclass(required.qualified_name) " ++
+                "LEFT JOIN pg_catalog.pg_index AS i ON i.indexrelid = c.oid",
+        );
+        defer self.allocator.free(relations_q);
+        const relations_result = try self.exec(relations_q);
+        defer c.PQclear(relations_result);
+        if (c.PQntuples(relations_result) != 1 or
+            c.PQgetisnull(relations_result, 0, 0) != 0 or
+            !std.mem.eql(u8, std.mem.span(c.PQgetvalue(relations_result, 0, 0)), "t"))
+        {
+            return false;
+        }
+
+        const triggers_q = try self.buildQuery(
+            "SELECT COALESCE(bool_and(t.oid IS NOT NULL AND t.tgenabled <> 'D'), FALSE) " ++
+                "FROM (VALUES " ++
+                "('{schema}.meeting_memory_crypto_state', 'meeting_memory_crypto_state_no_update_delete'), " ++
+                "('{schema}.meeting_memory_crypto_state', 'meeting_memory_crypto_state_no_truncate'), " ++
+                "('{schema}.meeting_memory_erasure_tombstones', 'meeting_memory_erasure_tombstones_no_update_delete'), " ++
+                "('{schema}.meeting_memory_erasure_tombstones', 'meeting_memory_erasure_tombstones_no_truncate'), " ++
+                "('{schema}.meeting_memory_account_erasure_tombstones', 'meeting_memory_account_tombstones_no_update_delete'), " ++
+                "('{schema}.meeting_memory_account_erasure_tombstones', 'meeting_memory_account_tombstones_no_truncate'), " ++
+                "('{schema}.meeting_memory_erasure_receipts', 'meeting_memory_erasure_receipts_no_update'), " ++
+                "('{schema}.meeting_memory_erasure_receipts', 'meeting_memory_erasure_receipts_no_truncate')) " ++
+                "AS required(qualified_name, trigger_name) " ++
+                "LEFT JOIN pg_catalog.pg_trigger AS t " ++
+                "ON t.tgrelid = to_regclass(required.qualified_name) " ++
+                "AND t.tgname = required.trigger_name AND NOT t.tgisinternal",
+        );
+        defer self.allocator.free(triggers_q);
+        const triggers_result = try self.exec(triggers_q);
+        defer c.PQclear(triggers_result);
+        return c.PQntuples(triggers_result) == 1 and
+            c.PQgetisnull(triggers_result, 0, 0) == 0 and
+            std.mem.eql(u8, std.mem.span(c.PQgetvalue(triggers_result, 0, 0)), "t");
+    }
+
     /// The secondary public key supports the next/previous halves of a
     /// two-phase rolling rotation. Validate every retained key ID at boot (and
     /// in the test hook) so key retirement cannot outrun receipt retention.
@@ -2373,6 +2495,10 @@ const ManagerImpl = struct {
         self: *Self,
         candidate: ?*const MeetingMemoryCrypto,
     ) !void {
+        const schema_ready = try self.meetingMemorySchemaReady();
+        if (candidate != null and !schema_ready) {
+            return error.MeetingMemorySchemaUnavailable;
+        }
         const relation_q = try self.buildQuery(
             "SELECT to_regclass('{schema}.meeting_memory_crypto_state') IS NOT NULL",
         );
@@ -2398,6 +2524,10 @@ const ManagerImpl = struct {
         const state_rows = c.PQntuples(state_result);
         if (state_rows > 1) return error.InvalidMeetingMemoryCryptoState;
         if (state_rows == 0) {
+            // A disabled/default-off deployment may encounter a partially
+            // staged but unused schema and must still boot. The complete
+            // schema path retains the orphan-residue consistency check below.
+            if (!schema_ready) return;
             const residue_q = try self.buildQuery(
                 "SELECT EXISTS (SELECT 1 FROM {schema}.memory_source_links LIMIT 1) " ++
                     "OR EXISTS (SELECT 1 FROM {schema}.meeting_memory_erasure_tombstones LIMIT 1) " ++
@@ -6202,6 +6332,9 @@ const ManagerImpl = struct {
         event_type: []const u8,
     ) !void {
         try assertGenericMemoryMutationAllowed(key);
+        if (std.mem.eql(u8, event_type, "compose")) {
+            try assertGenericComposeMetadataAllowed(self.allocator, metadata_json);
+        }
         if (memory_root.containsAssistantScaffold(content)) {
             log.warn("memory.write_rejected_assistant_scaffold path=metadata user_id={d} len={d}", .{ user_id, content.len });
             return error.AssistantScaffoldRejected;
@@ -9612,19 +9745,19 @@ const ManagerImpl = struct {
                 // Source-governed Minutes edges must never be copied into the
                 // generic pending-conflicts sentinel. Filter both carriers so
                 // legacy/adversarial rows cannot bypass exact erasure.
-                "AND LEFT(source_key, length($2::text)) <> $2::text " ++
-                "AND LEFT(target_key, length($2::text)) <> $2::text " ++
+                "AND source_key !~ $2::text " ++
+                "AND target_key !~ $2::text " ++
                 "GROUP BY source_key, predicate " ++
                 "HAVING COUNT(DISTINCT target_key) > 1 " ++
                 "ORDER BY source_key, predicate",
         );
         defer self.allocator.free(survey_q);
-        const meeting_prefix_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_prefix);
-        defer self.allocator.free(meeting_prefix_z);
-        const survey_params = [_]?[*:0]const u8{ user_s.ptr, meeting_prefix_z };
+        const meeting_key_regex_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_regex);
+        defer self.allocator.free(meeting_key_regex_z);
+        const survey_params = [_]?[*:0]const u8{ user_s.ptr, meeting_key_regex_z };
         const survey_lengths = [_]c_int{
             @intCast(user_s.len),
-            @intCast(meeting_memory.memory_key_prefix.len),
+            @intCast(meeting_memory.memory_key_regex.len),
         };
         const survey_result = try self.execParams(survey_q, &survey_params, &survey_lengths);
         defer c.PQclear(survey_result);
@@ -9832,7 +9965,7 @@ const ManagerImpl = struct {
                 // Source-governed Minutes rows may only be changed by their
                 // dedicated writer/eraser. Filter them from this tenant-wide
                 // batch without failing decay for unrelated memories.
-                "  AND LEFT(m.key, length($4::text)) <> $4::text " ++
+                "  AND m.key !~ $4::text " ++
                 // Phase-0.5b H3: persistent confidence decay now EXEMPTS the
                 // evergreen types (core/preference/decision/person), matching
                 // the in-memory isEvergreenCategory predicate. open_loop is
@@ -9845,19 +9978,19 @@ const ManagerImpl = struct {
                 "FROM decay",
         );
         defer self.allocator.free(decay_q);
-        const meeting_prefix_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_prefix);
-        defer self.allocator.free(meeting_prefix_z);
+        const meeting_key_regex_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_regex);
+        defer self.allocator.free(meeting_key_regex_z);
         const decay_params = [_]?[*:0]const u8{
             user_s.ptr,
             threshold_s.ptr,
             halflife_s.ptr,
-            meeting_prefix_z,
+            meeting_key_regex_z,
         };
         const decay_lengths = [_]c_int{
             @intCast(user_s.len),
             @intCast(threshold_s.len),
             @intCast(halflife_s.len),
-            @intCast(meeting_memory.memory_key_prefix.len),
+            @intCast(meeting_memory.memory_key_regex.len),
         };
         const decay_result = try txn.execParams(decay_q, &decay_params, &decay_lengths);
         defer c.PQclear(decay_result);
@@ -10040,7 +10173,7 @@ const ManagerImpl = struct {
                 // The prose judge's verdicts feed a generic metadata writer.
                 // Never put a source-governed Minutes key into that candidate
                 // set, even though the row remains user-visible and searchable.
-                "AND LEFT(key, length($4::text)) <> $4::text " ++
+                "AND key !~ $4::text " ++
                 // system-managed append-only writes (compaction artifacts,
                 // session-level summaries that aren't user-facing
                 // continuity facts; we keep summary_latest/ and
@@ -10070,15 +10203,15 @@ const ManagerImpl = struct {
         defer self.allocator.free(limit_text);
         const limit_z = try self.allocator.dupeZ(u8, limit_text);
         defer self.allocator.free(limit_z);
-        const meeting_prefix_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_prefix);
-        defer self.allocator.free(meeting_prefix_z);
+        const meeting_key_regex_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_regex);
+        defer self.allocator.free(meeting_key_regex_z);
 
-        const params = [_]?[*:0]const u8{ user_s.ptr, ilike_z, limit_z, meeting_prefix_z };
+        const params = [_]?[*:0]const u8{ user_s.ptr, ilike_z, limit_z, meeting_key_regex_z };
         const lengths = [_]c_int{
             @intCast(user_s.len),
             @intCast(ilike_pattern.len),
             @intCast(limit_text.len),
-            @intCast(meeting_memory.memory_key_prefix.len),
+            @intCast(meeting_memory.memory_key_regex.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
@@ -12858,7 +12991,7 @@ const ManagerImpl = struct {
                 "pinned = EXCLUDED.pinned, " ++
                 "last_touched_at = NOW() " ++
                 "WHERE existing.source_key IS NULL " ++
-                "OR LEFT(existing.source_key, length($9::text)) <> $9::text " ++
+                "OR existing.source_key !~ $9::text " ++
                 "RETURNING slot_id",
         );
         defer self.allocator.free(q);
@@ -12881,13 +13014,13 @@ const ManagerImpl = struct {
         const pinned_str: []const u8 = if (pinned) "t" else "f";
         const pinned_z = try self.allocator.dupeZ(u8, pinned_str);
         defer self.allocator.free(pinned_z);
-        const meeting_prefix_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_prefix);
-        defer self.allocator.free(meeting_prefix_z);
+        const meeting_key_regex_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_regex);
+        defer self.allocator.free(meeting_key_regex_z);
 
         const params = [_]?[*:0]const u8{
-            user_s.ptr,       sid_z,                                  slot_s.ptr, stype_z,
-            content_z,        if (source_key == null) null else sk_z, imp_s.ptr,  pinned_z,
-            meeting_prefix_z,
+            user_s.ptr,          sid_z,                                  slot_s.ptr, stype_z,
+            content_z,           if (source_key == null) null else sk_z, imp_s.ptr,  pinned_z,
+            meeting_key_regex_z,
         };
         const lengths = [_]c_int{
             @intCast(user_s.len),
@@ -12898,7 +13031,7 @@ const ManagerImpl = struct {
             @intCast(sk_text.len),
             @intCast(imp_s.len),
             @intCast(pinned_str.len),
-            @intCast(meeting_memory.memory_key_prefix.len),
+            @intCast(meeting_memory.memory_key_regex.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
@@ -12918,7 +13051,7 @@ const ManagerImpl = struct {
         const q = try self.buildQuery(
             "UPDATE {schema}.working_memory SET last_touched_at = NOW() " ++
                 "WHERE user_id = $1 AND session_id = $2 AND slot_id = $3 " ++
-                "AND (source_key IS NULL OR LEFT(source_key, length($4::text)) <> $4::text)",
+                "AND (source_key IS NULL OR source_key !~ $4::text)",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -12927,14 +13060,14 @@ const ManagerImpl = struct {
         defer self.allocator.free(sid_z);
         var slot_buf: [16]u8 = undefined;
         const slot_s = try std.fmt.bufPrintZ(&slot_buf, "{d}", .{slot_id});
-        const meeting_prefix_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_prefix);
-        defer self.allocator.free(meeting_prefix_z);
-        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z, slot_s.ptr, meeting_prefix_z };
+        const meeting_key_regex_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_regex);
+        defer self.allocator.free(meeting_key_regex_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z, slot_s.ptr, meeting_key_regex_z };
         const lengths = [_]c_int{
             @intCast(user_s.len),
             @intCast(session_id.len),
             @intCast(slot_s.len),
-            @intCast(meeting_memory.memory_key_prefix.len),
+            @intCast(meeting_memory.memory_key_regex.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
@@ -12951,7 +13084,7 @@ const ManagerImpl = struct {
         const q = try self.buildQuery(
             "DELETE FROM {schema}.working_memory " ++
                 "WHERE user_id = $1 AND session_id = $2 AND slot_id = $3 " ++
-                "AND (source_key IS NULL OR LEFT(source_key, length($4::text)) <> $4::text)",
+                "AND (source_key IS NULL OR source_key !~ $4::text)",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -12960,14 +13093,14 @@ const ManagerImpl = struct {
         defer self.allocator.free(sid_z);
         var slot_buf: [16]u8 = undefined;
         const slot_s = try std.fmt.bufPrintZ(&slot_buf, "{d}", .{slot_id});
-        const meeting_prefix_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_prefix);
-        defer self.allocator.free(meeting_prefix_z);
-        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z, slot_s.ptr, meeting_prefix_z };
+        const meeting_key_regex_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_regex);
+        defer self.allocator.free(meeting_key_regex_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z, slot_s.ptr, meeting_key_regex_z };
         const lengths = [_]c_int{
             @intCast(user_s.len),
             @intCast(session_id.len),
             @intCast(slot_s.len),
-            @intCast(meeting_memory.memory_key_prefix.len),
+            @intCast(meeting_memory.memory_key_regex.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
@@ -12985,20 +13118,20 @@ const ManagerImpl = struct {
         const q = try self.buildQuery(
             "DELETE FROM {schema}.working_memory " ++
                 "WHERE user_id = $1 AND session_id = $2 " ++
-                "AND (source_key IS NULL OR LEFT(source_key, length($3::text)) <> $3::text)",
+                "AND (source_key IS NULL OR source_key !~ $3::text)",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
         const sid_z = try self.allocator.dupeZ(u8, session_id);
         defer self.allocator.free(sid_z);
-        const meeting_prefix_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_prefix);
-        defer self.allocator.free(meeting_prefix_z);
-        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z, meeting_prefix_z };
+        const meeting_key_regex_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_regex);
+        defer self.allocator.free(meeting_key_regex_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z, meeting_key_regex_z };
         const lengths = [_]c_int{
             @intCast(user_s.len),
             @intCast(session_id.len),
-            @intCast(meeting_memory.memory_key_prefix.len),
+            @intCast(meeting_memory.memory_key_regex.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
@@ -13033,17 +13166,17 @@ const ManagerImpl = struct {
         const q = try self.buildQuery(
             "DELETE FROM {schema}.working_memory " ++
                 "WHERE last_touched_at < NOW() - ($1::int * INTERVAL '1 day') " ++
-                "AND (source_key IS NULL OR LEFT(source_key, length($2::text)) <> $2::text)",
+                "AND (source_key IS NULL OR source_key !~ $2::text)",
         );
         defer self.allocator.free(q);
         var days_buf: [16]u8 = undefined;
         const days_s = try std.fmt.bufPrintZ(&days_buf, "{d}", .{retention_days});
-        const meeting_prefix_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_prefix);
-        defer self.allocator.free(meeting_prefix_z);
-        const params = [_]?[*:0]const u8{ days_s.ptr, meeting_prefix_z };
+        const meeting_key_regex_z = try self.allocator.dupeZ(u8, meeting_memory.memory_key_regex);
+        defer self.allocator.free(meeting_key_regex_z);
+        const params = [_]?[*:0]const u8{ days_s.ptr, meeting_key_regex_z };
         const lengths = [_]c_int{
             @intCast(days_s.len),
-            @intCast(meeting_memory.memory_key_prefix.len),
+            @intCast(meeting_memory.memory_key_regex.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
@@ -26270,18 +26403,25 @@ test "WP-15 traversal persistence rejects meeting-derived keys in direct payload
         error.MeetingMemoryRequiresDedicatedMutation,
         manager.insertTraversalEvent(
             42,
-            "{\"action\":\"view_graph\",\"node_keys\":[\"generic\",\"meeting_ingest/reserved\"]}",
+            "{\"action\":\"view_graph\",\"node_keys\":[\"generic\",\"meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"]}",
         ),
     );
     try std.testing.expectError(
         error.MeetingMemoryRequiresDedicatedMutation,
         manager.insertTraversalEvent(
             42,
-            "{\"nested\":{\"meeting_ingest/reserved-object-key\":true}}",
+            "{\"nested\":{\"prefix:meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:suffix\":true}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        manager.insertTraversalEvent(
+            42,
+            "{\"nested\":[{\"value\":\"before meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef after\"}]}",
         ),
     );
     try manager.insertTraversalEvent(
         42,
-        "{\"action\":\"view_timeline\",\"entry_keys\":[\"meeting_ingestion/near-miss\",\"generic\"]}",
+        "{\"action\":\"view_timeline\",\"entry_keys\":[\"meeting_ingest/legacy-user-key\",\"meeting_ingestion/near-miss\",\"generic\"]}",
     );
 }

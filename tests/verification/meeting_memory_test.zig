@@ -16,6 +16,9 @@ const c = @cImport({
 
 const meeting_memory = nullalis.meeting_memory;
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
 const test_pseudonym_key = [_]u8{0xa5} ** 32;
 const test_receipt_signing_seed = [_]u8{0x31} ** 32;
 const test_pseudonymizer = blk: {
@@ -28,6 +31,118 @@ test "WP-15 migrations remain unregistered while Minutes activation is off" {
         try std.testing.expect(!std.mem.eql(u8, migration.name, "0011_meeting_memory_provenance"));
         try std.testing.expect(!std.mem.eql(u8, migration.name, "0012_meeting_memory_erasure_indexes"));
     }
+}
+
+test "WP-15 live: default-off boots but explicit crypto rejects an unregistered schema" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const test_url = try harness.requirePostgresUrl(allocator);
+
+    const pseudonym_env = "NULLALIS_WP15_SCHEMA_BOOT_PSEUDONYM";
+    const receipt_env = "NULLALIS_WP15_SCHEMA_BOOT_RECEIPT";
+    if (setenv(pseudonym_env, "pseudonym-material-for-schema-boot-0001", 1) != 0 or
+        setenv(receipt_env, "receipt-material-for-schema-boot-000001", 1) != 0)
+    {
+        return error.TestEnvironmentSetupFailed;
+    }
+    defer {
+        _ = unsetenv(pseudonym_env);
+        _ = unsetenv(receipt_env);
+    }
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try harness.schemaName(&schema_buf, "meeting_schema_absent");
+    const drop_sql = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema});
+    defer execPostgresSql(allocator, test_url, drop_sql, true) catch |err| {
+        std.debug.print("WP-15 absent-schema cleanup failed: {s}\n", .{@errorName(err)});
+    };
+
+    const dormant_cfg = nullalis.config.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+        // Secret projection alone does not activate Minutes.
+        .meeting_memory_crypto = .{
+            .enabled = false,
+            .pseudonym_key_env = pseudonym_env,
+            .receipt_signing_seed_env = receipt_env,
+        },
+    };
+    {
+        var dormant = try nullalis.zaki_state.Manager.init(allocator, dormant_cfg);
+        defer dormant.deinit();
+    }
+
+    var enabled_cfg = dormant_cfg;
+    enabled_cfg.meeting_memory_crypto.enabled = true;
+    try std.testing.expectError(
+        error.MeetingMemorySchemaUnavailable,
+        nullalis.zaki_state.Manager.init(allocator, enabled_cfg),
+    );
+}
+
+test "WP-15 live: explicit crypto rejects incomplete indexes and boots when complete" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const test_url = try harness.requirePostgresUrl(allocator);
+
+    const pseudonym_env = "NULLALIS_WP15_INDEX_BOOT_PSEUDONYM";
+    const receipt_env = "NULLALIS_WP15_INDEX_BOOT_RECEIPT";
+    if (setenv(pseudonym_env, "pseudonym-material-for-index-boot-00001", 1) != 0 or
+        setenv(receipt_env, "receipt-material-for-index-boot-0000001", 1) != 0)
+    {
+        return error.TestEnvironmentSetupFailed;
+    }
+    defer {
+        _ = unsetenv(pseudonym_env);
+        _ = unsetenv(receipt_env);
+    }
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try harness.schemaName(&schema_buf, "meeting_schema_index");
+    const drop_sql = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema});
+    defer execPostgresSql(allocator, test_url, drop_sql, true) catch |err| {
+        std.debug.print("WP-15 index-schema cleanup failed: {s}\n", .{@errorName(err)});
+    };
+
+    const dormant_cfg = nullalis.config.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    {
+        var staging = try nullalis.zaki_state.Manager.init(allocator, dormant_cfg);
+        defer staging.deinit();
+        try installMeetingMemorySchemaForTest(allocator, test_url, schema);
+    }
+
+    const drop_index_sql = try std.fmt.allocPrint(
+        allocator,
+        "DROP INDEX {s}.idx_memory_edges_target_all",
+        .{schema},
+    );
+    try execPostgresSql(allocator, test_url, drop_index_sql, true);
+
+    var enabled_cfg = dormant_cfg;
+    enabled_cfg.meeting_memory_crypto = .{
+        .enabled = true,
+        .pseudonym_key_env = pseudonym_env,
+        .receipt_signing_seed_env = receipt_env,
+    };
+    try std.testing.expectError(
+        error.MeetingMemorySchemaUnavailable,
+        nullalis.zaki_state.Manager.init(allocator, enabled_cfg),
+    );
+
+    const restore_index_sql = try std.fmt.allocPrint(
+        allocator,
+        "CREATE INDEX idx_memory_edges_target_all ON {s}.memory_edges (user_id, target_key)",
+        .{schema},
+    );
+    try execPostgresSql(allocator, test_url, restore_index_sql, true);
+
+    var enabled = try nullalis.zaki_state.Manager.init(allocator, enabled_cfg);
+    defer enabled.deinit();
 }
 
 fn installMeetingMemoryCrypto(mgr: anytype) !void {
@@ -609,6 +724,41 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const memory_b = try prepared(meeting_b, .decision, identical_text, "grant-b");
     const memory_other_tenant = try prepared(other_tenant, .decision, identical_text, "grant-c");
 
+    // The prefix alone is not a reservation: legacy/malformed occupants stay
+    // ordinary generic memories. A canonical same-key occupant, however, is
+    // never adopted by the dedicated writer without its exact source link.
+    try mgr.upsertMemory(
+        user_a,
+        "meeting_ingest/legacy-user-key",
+        "Launch the pilot from a legacy generic key",
+        .core,
+        null,
+    );
+    const collision_memory = try prepared(
+        try source(user_a, "transcript-collision", "meeting-collision"),
+        .decision,
+        "Dedicated ingest must not adopt this row",
+        "grant-collision",
+    );
+    const collision_seed_sql = try std.fmt.allocPrint(
+        allocator,
+        "INSERT INTO {s}.memories (id, user_id, key, content, memory_type) " ++
+            "VALUES ('wp15-generic-collision', {d}, '{s}', 'pre-existing generic row', 'core')",
+        .{ schema, user_a, collision_memory.provenance.identity.memoryKey() },
+    );
+    try execPostgresSql(allocator, test_url, collision_seed_sql, true);
+    try std.testing.expectError(
+        error.MeetingMemoryKeyCollision,
+        mgr.storeMeetingMemory(collision_memory),
+    );
+    const collision_row = (try mgr.getMemory(
+        allocator,
+        user_a,
+        collision_memory.provenance.identity.memoryKey(),
+    )).?;
+    defer collision_row.deinit(allocator);
+    try std.testing.expectEqualStrings("pre-existing generic row", collision_row.content);
+
     // A copied authority must not be able to pair tenant B with tenant A's
     // meeting digest. Reject it before locks/tombstones so tenant A's later
     // legitimate erasure cannot be poisoned by the global digest uniqueness.
@@ -645,6 +795,45 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const replay = try mgr.storeMeetingMemory(memory_a);
     try std.testing.expect(!replay.inserted);
     try std.testing.expectEqualStrings(first.memoryKey(), replay.memoryKey());
+
+    // A generic compose row would copy the meeting content outside the exact
+    // source-link erasure graph. Both the agent tool and the shared metadata
+    // writeback boundary must reject that derivation before any compose row or
+    // compose event lands.
+    try mgr.upsertMemory(user_a, "generic-compose-source", "Ordinary source", .core, null);
+    var postgres_memory = nullalis.memory.ZakiPostgresMemory.init(allocator, &mgr, user_a);
+    var compose_tool = nullalis.tools.compose_memory.ComposeMemoryTool{
+        .memory = postgres_memory.memory(),
+        .state_mgr = &mgr,
+        .user_id = user_a,
+    };
+    const compose_args_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"action\":\"create\",\"title\":\"Meeting copy\",\"content\":\"{s}\",\"references\":[\"generic-compose-source\",\"{s}\"],\"key\":\"compose:wp15-meeting-copy\"}}",
+        .{ identical_text, first.memoryKey() },
+    );
+    var compose_args = try std.json.parseFromSlice(std.json.Value, allocator, compose_args_json, .{});
+    defer compose_args.deinit();
+    const compose_result = try compose_tool.tool().execute(allocator, compose_args.value.object);
+    try std.testing.expect(!compose_result.success);
+    try std.testing.expect(std.mem.indexOf(u8, compose_result.error_msg.?, "transitive erasure") != null);
+
+    const direct_compose_metadata = try std.fmt.allocPrint(
+        allocator,
+        "{{\"synthesized_by\":\"user\",\"references\":[\"generic-compose-source\",\"{s}\"]}}",
+        .{first.memoryKey()},
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.upsertMemoryWithMetadata(
+            user_a,
+            "compose:wp15-direct-meeting-copy",
+            identical_text,
+            .core,
+            null,
+            direct_compose_metadata,
+        ),
+    );
 
     // Persisted pseudonyms are bound to one deployment key. A differently
     // keyed runtime must fail closed instead of creating a second digest
@@ -831,11 +1020,16 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const prose_facts = try mgr.fetchProseFactsByPattern(allocator, user_a, "Launch the pilot", 100);
     defer nullalis.memory.freeProseFacts(allocator, prose_facts);
     var saw_generic_prose = false;
+    var saw_legacy_prefixed_prose = false;
     for (prose_facts) |fact| {
-        try std.testing.expect(!std.mem.startsWith(u8, fact.key, meeting_memory.memory_key_prefix));
+        try std.testing.expect(!nullalis.memory.isMeetingDerivedMemoryKey(fact.key));
         if (std.mem.eql(u8, fact.key, "generic-identical")) saw_generic_prose = true;
+        if (std.mem.eql(u8, fact.key, "meeting_ingest/legacy-user-key")) {
+            saw_legacy_prefixed_prose = true;
+        }
     }
     try std.testing.expect(saw_generic_prose);
+    try std.testing.expect(saw_legacy_prefixed_prose);
 
     // Temporal decay is a tenant-wide batch operation. It must continue to
     // decay ordinary open loops while filtering the governed Minutes row.
@@ -1109,6 +1303,15 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const gone = try mgr.getMemory(allocator, user_a, first.memoryKey());
     if (gone) |entry| entry.deinit(allocator);
     try std.testing.expect(gone == null);
+
+    // Regression: erasure must not reveal an orphaned generic derivative.
+    // These keys were refused before writeback, so both remain absent after
+    // the source meeting and all of its direct carriers are erased.
+    inline for (.{ "compose:wp15-meeting-copy", "compose:wp15-direct-meeting-copy" }) |derived_key| {
+        const derived = try mgr.getMemory(allocator, user_a, derived_key);
+        if (derived) |entry| entry.deinit(allocator);
+        try std.testing.expect(derived == null);
+    }
 
     const generic = try mgr.getMemory(allocator, user_a, "generic-identical");
     if (generic) |entry| entry.deinit(allocator);
