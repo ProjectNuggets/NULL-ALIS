@@ -22099,6 +22099,55 @@ test "P7 person-as-subject — extracted edge makes the subject a resolvable nod
         defer allocator.free(cnt);
         try std.testing.expectEqualStrings("0", cnt); // no "user" entity node minted
     }
+
+    // ── Fact 3: self OBJECT — the fact itself remains durable, but the
+    //    speaker pseudo-entity must not become a graph node or edge target.
+    const self_object_fact = [_]extraction_persist.ExtractedMemory{.{
+        .text = "Tarek helps the assistant",
+        .subject = "Tarek",
+        .predicate = "HELPS",
+        .object = "assistant",
+        .attributed_to = "user",
+        .confidence = 0.9,
+    }};
+    const r3 = try extraction_persist.persistExtracted(
+        allocator,
+        &mgr,
+        2,
+        "p7-subject-session",
+        &self_object_fact,
+        null,
+        coref,
+        null,
+        .test_wire,
+        0,
+        true,
+    );
+    try std.testing.expectEqual(@as(usize, 1), r3.written_count);
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT " ++
+                "(SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND content = 'Tarek helps the assistant'), " ++
+                "(SELECT COUNT(*) FROM {s}.memory_entities WHERE user_id = 2 AND name_lower = 'assistant'), " ++
+                "(SELECT COUNT(*) FROM {s}.memory_edges WHERE user_id = 2 AND fact = 'Tarek helps the assistant')",
+            .{ schema_q, schema_q, schema_q },
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const memory_count = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(memory_count);
+        const entity_count = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(entity_count);
+        const edge_count = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(edge_count);
+        try std.testing.expectEqualStrings("1", memory_count);
+        try std.testing.expectEqualStrings("0", entity_count);
+        try std.testing.expectEqualStrings("0", edge_count);
+    }
 }
 
 test "brain-leak A: scaffold triples rejected at persist write boundary; real fact persists" {
