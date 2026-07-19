@@ -22191,24 +22191,72 @@ test "P7 person-as-subject — extracted edge makes the subject a resolvable nod
             "SELECT " ++
                 "(SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND content IN " ++
                 "('Sentinel Alpha found no connection to Sentinel Beta', 'Sentinel Gamma describes Sentinel Delta')), " ++
+                "(SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND content IN " ++
+                "('Sentinel Alpha found no connection to Sentinel Beta', 'Sentinel Gamma describes Sentinel Delta') " ++
+                "AND key NOT LIKE 'audit_shell/extraction_sentinel/%'), " ++
                 "(SELECT COUNT(*) FROM {s}.memory_entities WHERE user_id = 2 AND name_lower IN " ++
                 "('sentinel alpha', 'sentinel beta', 'sentinel gamma', 'sentinel delta')), " ++
                 "(SELECT COUNT(*) FROM {s}.memory_edges WHERE user_id = 2 AND fact IN " ++
                 "('Sentinel Alpha found no connection to Sentinel Beta', 'Sentinel Gamma describes Sentinel Delta'))",
-            .{ schema_q, schema_q, schema_q },
+            .{ schema_q, schema_q, schema_q, schema_q },
         );
         defer allocator.free(q);
         const result = try mgr.exec(q);
         defer c.PQclear(result);
         const memory_count = try dupeResultValue(allocator, result, 0, 0);
         defer allocator.free(memory_count);
-        const entity_count = try dupeResultValue(allocator, result, 0, 1);
+        const visible_memory_count = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(visible_memory_count);
+        const entity_count = try dupeResultValue(allocator, result, 0, 2);
         defer allocator.free(entity_count);
-        const edge_count = try dupeResultValue(allocator, result, 0, 2);
+        const edge_count = try dupeResultValue(allocator, result, 0, 3);
         defer allocator.free(edge_count);
         try std.testing.expectEqualStrings("2", memory_count);
+        try std.testing.expectEqualStrings("0", visible_memory_count);
         try std.testing.expectEqualStrings("0", entity_count);
         try std.testing.expectEqualStrings("0", edge_count);
+    }
+
+    // ── Fact 6: conversational meta-narrative predicates are not user/world
+    //    knowledge. They must remain fully rejected rather than surviving as a
+    //    visible, recallable memory merely because graph materialization is
+    //    suppressed.
+    const meta_narrative_fact = [_]extraction_persist.ExtractedMemory{.{
+        .text = "Sentinel Epsilon greeted Sentinel Zeta",
+        .subject = "Sentinel Epsilon",
+        .predicate = "GREETED",
+        .object = "Sentinel Zeta",
+        .attributed_to = "user",
+        .confidence = 0.9,
+    }};
+    const r5 = try extraction_persist.persistExtracted(
+        allocator,
+        &mgr,
+        2,
+        "p7-subject-session",
+        &meta_narrative_fact,
+        null,
+        coref,
+        null,
+        .test_wire,
+        0,
+        true,
+    );
+    try std.testing.expectEqual(@as(usize, 0), r5.written_count);
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND content = 'Sentinel Epsilon greeted Sentinel Zeta'",
+            .{schema_q},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const memory_count = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(memory_count);
+        try std.testing.expectEqualStrings("0", memory_count);
     }
 }
 

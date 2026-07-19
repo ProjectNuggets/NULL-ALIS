@@ -18,6 +18,7 @@ const memory_mod = @import("../memory/root.zig");
 const observability = @import("../observability.zig");
 const config_types = @import("../config_types.zig");
 const config_module = @import("../config.zig");
+const zaki_state = @import("../zaki_state.zig");
 const capabilities_mod = @import("../capabilities.zig");
 const config_mutator = @import("../config_mutator.zig");
 const context_report = @import("context_report.zig");
@@ -470,6 +471,31 @@ fn buildSessionEndTranscriptText(
     }
 
     return collected.toOwnedSlice(allocator);
+}
+
+pub const SessionEndEntityPipelineJob = struct {
+    id: i64,
+    payload_bytes: usize,
+};
+
+/// Serialize and enqueue the canonical session-end entity-pipeline job.
+/// Keeping the payload contract in one callable boundary lets production and
+/// the PostgreSQL worker integration test exercise the exact same wire shape.
+pub fn enqueueSessionEndEntityPipelineJob(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+    session_id: []const u8,
+    transcript_text: []const u8,
+) !SessionEndEntityPipelineJob {
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"transcript_text\":{f}}}",
+        .{std.json.fmt(transcript_text, .{})},
+    );
+    defer allocator.free(payload);
+    const job_id = try state_mgr.enqueueExtractionJob(user_id, session_id, "session_end", payload);
+    return .{ .id = job_id, .payload_bytes = payload.len };
 }
 
 fn setModelName(self: anytype, model: []const u8) !void {
@@ -1836,29 +1862,20 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                     // <5ms; heartbeat worker handles the actual
                     // extraction out-of-band. Idempotent w.r.t.
                     // earlier per-turn runs.
-                    const payload_str = std.fmt.allocPrint(
+                    const queued = enqueueSessionEndEntityPipelineJob(
                         self.allocator,
-                        "{{\"transcript_text\":{f}}}",
-                        .{std.json.fmt(tt, .{})},
-                    ) catch |err| blk: {
-                        log.warn("session_end.entity_pipeline.payload_alloc_failed err={s}", .{@errorName(err)});
-                        break :blk @as([]u8, &.{});
-                    };
-                    defer if (payload_str.len > 0) self.allocator.free(payload_str);
-
-                    const job_id = if (payload_str.len > 0) smgr_ep.enqueueExtractionJob(
+                        smgr_ep,
                         uid_ep,
                         session_id,
-                        "session_end",
-                        payload_str,
+                        tt,
                     ) catch |err| blk: {
                         log.warn("session_end.entity_pipeline.enqueue_failed err={s}", .{@errorName(err)});
-                        break :blk @as(i64, -1);
-                    } else @as(i64, -1);
+                        break :blk SessionEndEntityPipelineJob{ .id = -1, .payload_bytes = 0 };
+                    };
 
                     log.info(
                         "session_end.entity_pipeline_enqueued job_id={d} payload_bytes={d} session={s}",
-                        .{ job_id, payload_str.len, session_id },
+                        .{ queued.id, queued.payload_bytes, session_id },
                     );
                     if (emit_observer_events) {
                         const ep_event = observability.ObserverEvent{ .turn_stage = .{
@@ -7402,31 +7419,4 @@ test "/learn adopt on a legacy fact (no metadata header at all) reports 'already
     const entry = (try mem.get(allocator, "durable_fact/behavior/legacynoheader01")) orelse return error.EntryNotFound;
     defer entry.deinit(allocator);
     try std.testing.expectEqualStrings("onboarding reminders should be gentle", entry.content);
-}
-
-test "WP-MEM8: session end delegates graph edges to the entity pipeline" {
-    // Architecture regression guard scoped to the session-end summarizer:
-    // it persists durable facts and delegates graph writes to the configured
-    // classifier pipeline. Unrelated graph writers elsewhere in this large
-    // module must not make this contract fail.
-    const source = @embedFile("commands.zig");
-    const function_start = std.mem.indexOf(u8, source, "fn persistSessionSemanticSummary(") orelse
-        return error.TestExpectedEqual;
-    const function_end_relative = std.mem.indexOf(
-        u8,
-        source[function_start..],
-        "\npub fn persistSessionCheckpoint(",
-    ) orelse return error.TestExpectedEqual;
-    const function_source = source[function_start .. function_start + function_end_relative];
-    const legacy_origin = "session_end_" ++ "loop";
-    const legacy_key_helper = "deriveSessionEnd" ++ "EntityKey";
-
-    try std.testing.expect(std.mem.indexOf(u8, function_source, "deriveDurableFactKey") != null);
-    try std.testing.expect(std.mem.indexOf(u8, function_source, "mem.store(fact_key") != null);
-    try std.testing.expect(std.mem.indexOf(u8, function_source, "session_end_entity_pipeline_enabled") != null);
-    try std.testing.expect(std.mem.indexOf(u8, function_source, "enqueueExtractionJob(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, function_source, "\"session_end\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, function_source, ".upsertMemoryEdge(") == null);
-    try std.testing.expect(std.mem.indexOf(u8, function_source, legacy_origin) == null);
-    try std.testing.expect(std.mem.indexOf(u8, function_source, legacy_key_helper) == null);
 }

@@ -12,6 +12,10 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const build_options = @import("build_options");
+const pg_c = if (build_options.enable_postgres) @cImport({
+    @cInclude("libpq-fe.h");
+}) else struct {};
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const session_mod = @import("session.zig");
@@ -35,6 +39,8 @@ const providers = @import("providers/root.zig");
 const embeddings = @import("memory/vector/embeddings.zig");
 const circuit_breaker = @import("memory/vector/circuit_breaker.zig");
 const entity_pipeline = @import("agent/entity_pipeline.zig");
+const agent_commands = @import("agent/commands.zig");
+const memory_root = @import("memory/root.zig");
 const tools_mod = @import("tools/root.zig");
 const tool_sandbox_v1 = @import("tools/tool_sandbox_v1.zig");
 const entitlement_mod = @import("entitlement.zig");
@@ -4595,6 +4601,130 @@ test "extraction worker keeps provider and model selection paired" {
     );
     try std.testing.expectEqualStrings("moonshot", default_selected.provider.getName());
     try std.testing.expectEqualStrings("moonshotai/Kimi-K2.6", default_selected.model);
+}
+
+test "WP-MEM8 session-end queue processing creates entity-backed wiki-link edges" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = std.process.getEnvVarOwned(allocator, "NULLALIS_POSTGRES_TEST_URL") catch
+        return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [63]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "mem8_worker_{d}", .{std.time.microTimestamp()});
+    var mgr = try zaki_state.Manager.init(allocator, .{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    });
+    defer mgr.deinit();
+    defer {
+        const drop_sql = std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE", .{schema}) catch null;
+        if (drop_sql) |sql| {
+            defer allocator.free(sql);
+            const result = mgr.exec(sql) catch null;
+            if (result) |pg_result| pg_c.PQclear(@ptrCast(pg_result));
+        }
+    }
+
+    const user_id: i64 = 2;
+    const session_id = "session:mem8-behavior";
+    try mgr.provisionUser(user_id, "/tmp/nullalis-mem8-worker-test/workspace");
+    try mgr.upsertMemory(
+        user_id,
+        "durable_fact/mem8-behavior",
+        "The user is evaluating Helix for the Berlin launch.",
+        .core,
+        session_id,
+    );
+
+    _ = try agent_commands.enqueueSessionEndEntityPipelineJob(
+        allocator,
+        &mgr,
+        user_id,
+        session_id,
+        "User: I am evaluating Helix for our Berlin launch.",
+    );
+
+    const StubProvider = struct {
+        fn chatWithSystem(_: *anyopaque, _: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn chat(_: *anyopaque, a: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const content = try a.dupe(
+                u8,
+                "[{\"surface\":\"Helix\",\"canonical\":\"Helix\",\"type\":\"PRODUCT\",\"confidence\":0.97}," ++
+                    "{\"surface\":\"Berlin\",\"canonical\":\"Berlin\",\"type\":\"PLACE\",\"confidence\":0.95}]",
+            );
+            errdefer a.free(content);
+            const model = try a.dupe(u8, "stub-entity-model");
+            return .{ .content = content, .model = model };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "stub-session-end-extractor";
+        }
+
+        fn deinit(_: *anyopaque) void {}
+
+        const vtable = providers.Provider.VTable{
+            .chatWithSystem = chatWithSystem,
+            .chat = chat,
+            .supportsNativeTools = supportsNativeTools,
+            .getName = getName,
+            .deinit = deinit,
+        };
+
+        fn provider(self: *@This()) providers.Provider {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+    };
+
+    var provider_impl = StubProvider{};
+    const local_embedder = try embeddings.LocalHashEmbedding.init(allocator, 1024);
+    const embedder = local_embedder.provider();
+    defer embedder.deinit();
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis-mem8-worker-test/workspace",
+        .config_path = "/tmp/nullalis-mem8-worker-test/config.json",
+        .allocator = allocator,
+    };
+
+    try std.testing.expect(try processOneExtractionJob(
+        allocator,
+        &cfg,
+        &mgr,
+        provider_impl.provider(),
+        "stub-entity-model",
+        embedder,
+        null,
+    ));
+
+    const edges = try mgr.listEdgesForUser(allocator, user_id);
+    defer memory_root.freeTypedEdges(allocator, edges);
+    try std.testing.expect(edges.len > 0);
+    for (edges) |edge| {
+        try std.testing.expect(!std.mem.startsWith(u8, edge.target_key, "entity_"));
+        const target_keys = [_][]const u8{edge.target_key};
+        const target_entities = try mgr.findEntitiesByKeys(allocator, user_id, &target_keys);
+        defer {
+            for (target_entities) |*entity| entity.deinit(allocator);
+            allocator.free(target_entities);
+        }
+        try std.testing.expectEqual(@as(usize, 1), target_entities.len);
+    }
+
+    const attributed_edges = try mgr.listMemoryEdgesForCommunityCompute(allocator, user_id);
+    defer memory_root.freeCommunityEdges(allocator, attributed_edges);
+    try std.testing.expect(attributed_edges.len > 0);
+    for (attributed_edges) |edge| {
+        try std.testing.expectEqualStrings(entity_pipeline.WIKI_LINK_ATTRIBUTION, edge.attribution);
+        try std.testing.expect(!std.mem.eql(u8, edge.attribution, "session_end_loop"));
+    }
 }
 
 test "P1-6 extractor breaker — opens after N consecutive failures, skips during cooldown, half-opens, recovers" {
