@@ -189,6 +189,12 @@ fn executeCreate(
             const msg = try std.fmt.allocPrint(allocator, "references[{d}] key too long (max {d} chars)", .{ idx, MAX_REFERENCE_KEY_LEN });
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
+        // A generic compose row is not part of the Minutes source-link graph,
+        // so exact meeting erasure cannot find or delete copied content. Block
+        // the derivation until transitive provenance + erasure is implemented.
+        if (mem_root.isMeetingDerivedMemoryKey(r.string)) {
+            return ToolResult.fail("compose_memory: meeting-derived references cannot be composed until transitive erasure is supported");
+        }
     }
     // Detect duplicates — composing memory:k twice in the same synthesis is
     // a sign the agent is over-counting; surface it as an error rather than
@@ -403,6 +409,20 @@ test "compose_memory: assistant scaffold is rejected before reference processing
     const result = try compose.tool().execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "internal assistant context") != null);
+}
+
+test "compose_memory: canonical meeting references are rejected before writeback" {
+    var backend = mem_root.NoneMemory.init();
+    defer backend.deinit();
+    var compose = ComposeMemoryTool{ .memory = backend.memory() };
+    const parsed = try root.parseTestArgs(
+        "{\"action\":\"create\",\"title\":\"Meeting synthesis\",\"content\":\"Copied meeting content\",\"references\":[\"generic-source\",\"meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"],\"key\":\"compose:meeting-copy\"}",
+    );
+    defer parsed.deinit();
+
+    const result = try compose.tool().execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "transitive erasure") != null);
 }
 
 test "compose_memory: writeJsonString escapes special chars" {

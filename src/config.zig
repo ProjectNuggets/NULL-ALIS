@@ -4562,6 +4562,15 @@ test "tenant config parses enabled and data_root" {
     allocator.free(cfg.tenant.data_root);
 }
 
+test "meeting memory crypto configuration parses explicit enabled gate" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(
+        \\{"state":{"meeting_memory_crypto":{"enabled":true}}}
+    );
+    try std.testing.expect(cfg.state.meeting_memory_crypto.enabled);
+}
+
 test "session config parses cross_channel_shared_main" {
     const allocator = std.testing.allocator;
     const json =

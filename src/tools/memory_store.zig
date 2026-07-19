@@ -633,6 +633,18 @@ test "memory_store contract guard: system-managed key prefix is rejected" {
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "system-managed") != null);
 }
 
+test "WP-15 memory_store cannot forge the meeting_ingest namespace" {
+    var mt = MemoryStoreTool{ .memory = null };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs(
+        "{\"key\":\"meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"content\":\"forged meeting fact\"}",
+    );
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "system-managed") != null);
+}
+
 test "memory_store contract guard: bookkeeping namespaces (tombstone/audit) are rejected" {
     // Review finding #2 (2026-07-06): __tombstone__/ and audit_shell/ are
     // bookkeeping per the contract but were NOT covered by the original guard
@@ -677,6 +689,12 @@ test "memory_store contract guard: inlineKeyGuard families + storable keys" {
     // derives its own extracted_<hash> key.
     try std.testing.expect(MemoryStoreTool.inlineKeyGuard("Brain Architecture") != null);
     try std.testing.expect(MemoryStoreTool.inlineKeyGuard("summary_latest/x") != null);
+    // Malformed/legacy prefix occupants are ordinary user keys; only the
+    // canonical digest shape is reserved for the dormant Minutes writer.
+    try std.testing.expect(MemoryStoreTool.inlineKeyGuard("meeting_ingest/forged") == null);
+    try std.testing.expect(MemoryStoreTool.inlineKeyGuard(
+        "meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    ) != null);
     try std.testing.expect(MemoryStoreTool.inlineKeyGuard("__tombstone__/x") != null);
     try std.testing.expect(MemoryStoreTool.inlineKeyGuard("audit_shell/2026") != null);
     // Storable: plain user keys AND the dream cycle's dream_log/ namespace.

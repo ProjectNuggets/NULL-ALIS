@@ -10,6 +10,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const config_types = @import("../config_types.zig");
+const meeting_memory = @import("../meeting_memory.zig");
 const provider_api_key = @import("../providers/api_key.zig");
 const util = @import("../util.zig");
 const log = std.log.scoped(.memory);
@@ -1362,6 +1363,22 @@ pub fn isContinuitySummaryKey(key: []const u8) bool {
         std.mem.startsWith(u8, key, "summary_fallback/");
 }
 
+/// Meeting-derived Brain rows are visible to the user and keyword recall, but
+/// only the dedicated, separately-consented `meeting_ingest` writer/eraser may
+/// mutate them. Recognition is deliberately exact: reserving every string with
+/// the prefix would take ownership of unrelated legacy/user keys even when the
+/// dormant feature is disabled.
+pub fn isMeetingDerivedMemoryKey(key: []const u8) bool {
+    return meeting_memory.isCanonicalMemoryKey(key);
+}
+
+/// Traversal/event payloads may carry a canonical key inside a larger string.
+/// The exact eraser scans durable JSON carriers, so reject those embedded
+/// occurrences before persistence as well as standalone key strings.
+pub fn containsMeetingDerivedMemoryKey(value: []const u8) bool {
+    return meeting_memory.containsCanonicalMemoryKey(value);
+}
+
 pub fn isDefaultHiddenMemoryKey(key: []const u8) bool {
     return isInternalMemoryKey(key) or
         isAuditArtifactKey(key) or
@@ -1448,6 +1465,10 @@ pub fn isBrainVisibleKey(key: []const u8) bool {
 
 pub fn isSemanticBookkeepingKey(key: []const u8) bool {
     return isDefaultHiddenMemoryKey(key) or
+        // Meeting distillates stay brain-visible and keyword-recallable, but
+        // external vectors remain disabled until source-scoped vector erasure
+        // has a complete-or-loud production adapter.
+        isMeetingDerivedMemoryKey(key) or
         std.mem.eql(u8, key, "context_anchor_current") or
         // Package 3 Task 1 (M2): `history/<key>/<ts>` snapshots hold a
         // SUPERSEDED wording. Embedding them would pollute the pgvector fact
@@ -1513,6 +1534,7 @@ pub fn isAppendOnlyMemoryKey(key: []const u8) bool {
 
 pub fn isSystemManagedMemoryKey(key: []const u8) bool {
     return std.mem.eql(u8, key, "context_anchor_current") or
+        isMeetingDerivedMemoryKey(key) or
         std.mem.startsWith(u8, key, "summary_latest/") or
         // V1.10 Gap B fix — timeline_summary IS continuity per the role
         // taxonomy at line ~864 ("searchable, injectable, carries current
@@ -4307,6 +4329,20 @@ test "shouldEmbedMemoryEntry skips bookkeeping artifacts and oversize content" {
     var big: [2049]u8 = undefined;
     @memset(&big, 'a');
     try std.testing.expect(!shouldEmbedMemoryEntry("durable_fact/x", big[0..]));
+}
+
+test "WP-15 meeting-derived keys are protected visible and non-embeddable" {
+    const key = "meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    try std.testing.expect(isMeetingDerivedMemoryKey(key));
+    try std.testing.expect(!isMeetingDerivedMemoryKey("meeting_ingest/reserved-even-before-validation"));
+    try std.testing.expect(containsMeetingDerivedMemoryKey("nested:meeting_ingest/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    try std.testing.expect(isSystemManagedMemoryKey(key));
+    try std.testing.expect(!isEditableMemoryEntry(key, .{ .custom = "decision" }));
+    try std.testing.expect(isBrainVisibleKey(key));
+    try std.testing.expect(!isDefaultHiddenMemoryKey(key));
+    try std.testing.expect(isSemanticBookkeepingKey(key));
+    try std.testing.expect(!shouldEmbedMemoryEntry(key, "Launch the pilot on Tuesday"));
+    try std.testing.expect(!isMeetingDerivedMemoryKey("meeting_ingestion/user-key"));
 }
 
 test "P4b: continuity summaries are hidden from embedding but durable_fact stays recallable" {
