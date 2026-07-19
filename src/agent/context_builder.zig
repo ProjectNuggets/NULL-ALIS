@@ -3,7 +3,7 @@ const compaction = @import("compaction.zig");
 const context_cache = @import("context_cache.zig");
 const context_estimator = @import("context_estimator.zig");
 const model_capabilities = @import("model_capabilities.zig");
-const memory_root = @import("../memory/root.zig");
+const memory_link_types = @import("../memory/link_types.zig");
 const prompt = @import("prompt.zig");
 const providers = @import("../providers/root.zig");
 const tool_surface = @import("tool_surface.zig");
@@ -745,7 +745,7 @@ comptime {
 /// `isScaffoldEntityName`. This is the single list Fix A (extraction write
 /// boundary) and Fix C (C0 purge) consume. Importing `ALL_LINK_TYPES` keeps
 /// prompt and persistence policy in lockstep when the vocabulary changes.
-pub const scaffold_entity_names = scaffold_title_names ++ scaffold_internal_tokens ++ memory_root.ALL_LINK_TYPES;
+pub const scaffold_entity_names = scaffold_title_names ++ scaffold_internal_tokens ++ memory_link_types.ALL_LINK_TYPES;
 
 /// Whitespace-normalize `s` in place into `buf` (collapse internal runs of
 /// ASCII whitespace to a single space, trim ends, lowercase ASCII). Returns
@@ -836,7 +836,7 @@ test "isScaffoldEntityName: scaffold titles + body terms match (case/whitespace-
     try std.testing.expect(isScaffoldEntityName("Layer 7"));
     try std.testing.expect(isScaffoldEntityName("Knowledge graph"));
     try std.testing.expect(isScaffoldEntityName("Auto-promoted"));
-    for (memory_root.ALL_LINK_TYPES) |link_type| {
+    for (memory_link_types.ALL_LINK_TYPES) |link_type| {
         try std.testing.expect(isScaffoldEntityName(link_type));
     }
 }
