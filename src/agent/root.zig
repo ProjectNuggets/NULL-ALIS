@@ -856,7 +856,7 @@ pub const Agent = struct {
     minutes_read_disabled_for_turn: bool = false,
     /// The provider/prompt surface must match execution authorization. These
     /// borrowed views are installed for the duration of `turnOutcome`; when
-    /// Minutes has no foreground budget they exclude its tool and schema.
+    /// Minutes has no authorization state they exclude its tool and schema.
     current_turn_tool_surface_active: bool = false,
     current_turn_tools: []const Tool = &.{},
     current_turn_tool_specs: []const ToolSpec = &.{},
@@ -2204,11 +2204,11 @@ pub const Agent = struct {
         return false;
     }
 
-    fn minutesReadBudgetEligible(self: *const Agent) bool {
+    fn minutesReadStateEligible(self: *const Agent) bool {
         if (!self.hasMinutesReadTool()) return false;
         const turn_context = tools_mod.getTurnContext();
         if (tools_mod.isBackgroundTurnOrigin(turn_context.origin)) return false;
-        return turn_context.minutes_read_budget != null;
+        return turn_context.minutes_read_state != null;
     }
 
     fn minutesReadProviderSafe(self: *const Agent) bool {
@@ -2221,7 +2221,7 @@ pub const Agent = struct {
     }
 
     fn minutesReadRuntimeAuthorized(self: *const Agent) bool {
-        return self.minutesReadBudgetEligible() and self.minutesReadProviderSafe();
+        return self.minutesReadStateEligible() and self.minutesReadProviderSafe();
     }
 
     fn canInvokeMinutesRead(self: *const Agent) bool {
@@ -3561,7 +3561,7 @@ pub const Agent = struct {
 
         // The request-local Minutes surface and dispatch authority are one
         // capability. Models can hallucinate an unadvertised tool name; never
-        // let that bypass a missing foreground budget, a background origin,
+        // let that bypass missing authorization state, a background origin,
         // or the vision-sidecar incompatibility gate.
         if (isMinutesReadCall(call.name) and !self.canInvokeMinutesRead()) {
             return .{ .blocked = .{
@@ -4744,21 +4744,21 @@ pub const Agent = struct {
         // keep ordinary image behavior and remove Minutes from the complete
         // prompt/native/execution surface for this turn.
         const prior_minutes_vision_gate = self.minutes_read_disabled_for_turn;
-        const unsafe_minutes_transport = self.minutesReadBudgetEligible() and
+        const unsafe_minutes_transport = self.minutesReadStateEligible() and
             !self.minutesReadProviderSafe();
         self.minutes_read_disabled_for_turn = prior_minutes_vision_gate or
             unsafe_minutes_transport or self.shouldDisableMinutesForVision(user_message);
         defer self.minutes_read_disabled_for_turn = prior_minutes_vision_gate;
 
         const prior_runtime_turn_context = tools_mod.getTurnContext();
-        const minutes_budget_revoked = self.minutes_read_disabled_for_turn and
-            prior_runtime_turn_context.minutes_read_budget != null;
-        if (minutes_budget_revoked) {
+        const minutes_state_revoked = self.minutes_read_disabled_for_turn and
+            prior_runtime_turn_context.minutes_read_state != null;
+        if (minutes_state_revoked) {
             var vision_turn_context = prior_runtime_turn_context;
-            vision_turn_context.minutes_read_budget = null;
+            vision_turn_context.minutes_read_state = null;
             tools_mod.setTurnContext(vision_turn_context);
         }
-        defer if (minutes_budget_revoked) tools_mod.setTurnContext(prior_runtime_turn_context);
+        defer if (minutes_state_revoked) tools_mod.setTurnContext(prior_runtime_turn_context);
 
         const prior_stream_callback = self.stream_callback;
         const prior_stream_ctx = self.stream_ctx;
@@ -15853,10 +15853,10 @@ fn minutesTestRequestContains(request: providers.ChatRequest, needle: []const u8
     return false;
 }
 
-fn installMinutesTestTurnContext(budget: *tools_mod.MinutesReadTurnBudget) void {
+fn installMinutesTestTurnContext(state: *tools_mod.MinutesReadTurnState) void {
     tools_mod.setTurnContext(.{
         .origin = .user,
-        .minutes_read_budget = budget,
+        .minutes_read_state = state,
     });
 }
 
@@ -15999,8 +15999,9 @@ test "image fallback removes Minutes from request and blocks hallucinated execut
     };
     defer agent.deinit();
 
-    var minutes_budget = tools_mod.MinutesReadTurnBudget{};
-    installMinutesTestTurnContext(&minutes_budget);
+    var minutes_state = tools_mod.MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
+    installMinutesTestTurnContext(&minutes_state);
     defer tools_mod.clearTurnContext();
     var outcome = try agent.turnOutcome(
         "[IMAGE:data:image/png;base64,iVBORw0KGgo=] Describe this image.",
@@ -16015,7 +16016,7 @@ test "image fallback removes Minutes from request and blocks hallucinated execut
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
     try std.testing.expect(provider_state.saw_filtered_surface);
     try std.testing.expectEqual(@as(usize, 0), minutes_tool.call_count);
-    try std.testing.expect(tools_mod.getTurnContext().minutes_read_budget == &minutes_budget);
+    try std.testing.expect(tools_mod.getTurnContext().minutes_read_state == &minutes_state);
     for (agent.history.items) |message| {
         try std.testing.expect(std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
     }
@@ -16140,8 +16141,9 @@ test "unaudited provider removes Minutes from request and blocks hallucinated ex
     };
     defer agent.deinit();
 
-    var minutes_budget = tools_mod.MinutesReadTurnBudget{};
-    installMinutesTestTurnContext(&minutes_budget);
+    var minutes_state = tools_mod.MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
+    installMinutesTestTurnContext(&minutes_state);
     defer tools_mod.clearTurnContext();
     var outcome = try agent.turnOutcome("Summarize my last meeting.");
     defer outcome.deinit(allocator);
@@ -16151,7 +16153,7 @@ test "unaudited provider removes Minutes from request and blocks hallucinated ex
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
     try std.testing.expect(provider_state.saw_filtered_surface);
     try std.testing.expectEqual(@as(usize, 0), minutes_tool.call_count);
-    try std.testing.expect(tools_mod.getTurnContext().minutes_read_budget == &minutes_budget);
+    try std.testing.expect(tools_mod.getTurnContext().minutes_read_state == &minutes_state);
     for (agent.history.items) |message| {
         try std.testing.expect(std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
     }
@@ -16177,7 +16179,7 @@ test "parallel dispatch cannot execute Minutes without request capability" {
     agent.tool_specs = specs;
     defer agent.deinit();
 
-    tools_mod.setTurnContext(.{ .origin = .user, .minutes_read_budget = null });
+    tools_mod.setTurnContext(.{ .origin = .user, .minutes_read_state = null });
     defer tools_mod.clearTurnContext();
     const calls = [_]ParsedToolCall{
         .{ .name = MinutesForegroundSentinelTool.tool_name, .arguments_json = "{}", .tool_call_id = "minutes-parallel" },
@@ -16658,8 +16660,9 @@ test "minutes_read native streaming turn discards adversarial task plan and pres
         .is_dm = true,
     });
     defer tools_mod.clearMessageTurnContext();
-    var minutes_budget = tools_mod.MinutesReadTurnBudget{};
-    installMinutesTestTurnContext(&minutes_budget);
+    var minutes_state = tools_mod.MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
+    installMinutesTestTurnContext(&minutes_state);
     defer tools_mod.clearTurnContext();
 
     var outcome = try agent.turnOutcome(
@@ -16906,8 +16909,9 @@ test "minutes_read streaming exhaustion holds preamble so gateway replays blocki
     };
     defer agent.deinit();
 
-    var minutes_budget = tools_mod.MinutesReadTurnBudget{};
-    installMinutesTestTurnContext(&minutes_budget);
+    var minutes_state = tools_mod.MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
+    installMinutesTestTurnContext(&minutes_state);
     defer tools_mod.clearTurnContext();
     var outcome = try agent.turnOutcome(
         "[IMAGE:data:image/png;base64,iVBORw0KGgo=] Summarize my last meeting.",
@@ -17071,8 +17075,9 @@ test "minutes_read XML turn discards adversarial task plan and keeps raw transcr
     };
     defer agent.deinit();
 
-    var minutes_budget = tools_mod.MinutesReadTurnBudget{};
-    installMinutesTestTurnContext(&minutes_budget);
+    var minutes_state = tools_mod.MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
+    installMinutesTestTurnContext(&minutes_state);
     defer tools_mod.clearTurnContext();
     const response = try agent.turn("Summarize my last meeting through XML fallback.");
     defer allocator.free(response);
@@ -17201,8 +17206,9 @@ test "minutes_read foreground lane is destroyed on provider error" {
     };
     defer agent.deinit();
 
-    var minutes_budget = tools_mod.MinutesReadTurnBudget{};
-    installMinutesTestTurnContext(&minutes_budget);
+    var minutes_state = tools_mod.MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
+    installMinutesTestTurnContext(&minutes_state);
     defer tools_mod.clearTurnContext();
     try std.testing.expectError(error.DeliberateMinutesProviderFailure, agent.turn("Read a meeting, then fail safely."));
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);

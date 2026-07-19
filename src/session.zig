@@ -59,7 +59,7 @@ fn hasMinutesReadTool(tools: []const Tool) bool {
     return false;
 }
 
-fn shouldInstallMinutesReadBudget(
+fn shouldInstallMinutesReadState(
     tools: []const Tool,
     origin: tools_mod.TurnOrigin,
     message_turn_context: ?tools_mod.MessageTurnContext,
@@ -1252,19 +1252,20 @@ pub const SessionManager = struct {
 
         tools_mod.setMessageTurnContext(options.message_turn_context);
         defer tools_mod.clearMessageTurnContext();
-        const minutes_read_enabled = shouldInstallMinutesReadBudget(
+        const minutes_read_enabled = shouldInstallMinutesReadState(
             self.tools,
             options.turn_origin,
             options.message_turn_context,
         );
-        const minutes_read_budget: ?*tools_mod.MinutesReadTurnBudget = if (minutes_read_enabled) blk: {
-            const budget = try self.allocator.create(tools_mod.MinutesReadTurnBudget);
-            budget.* = .{};
-            break :blk budget;
+        const minutes_read_state: ?*tools_mod.MinutesReadTurnState = if (minutes_read_enabled) blk: {
+            const state = try self.allocator.create(tools_mod.MinutesReadTurnState);
+            state.* = tools_mod.MinutesReadTurnState.init(self.allocator);
+            break :blk state;
         } else null;
-        defer if (minutes_read_budget) |budget| {
-            std.crypto.secureZero(u8, std.mem.asBytes(budget));
-            self.allocator.destroy(budget);
+        defer if (minutes_read_state) |state| {
+            state.deinit();
+            std.crypto.secureZero(u8, std.mem.asBytes(state));
+            self.allocator.destroy(state);
         };
         tools_mod.setTurnContext(.{
             .origin = options.turn_origin,
@@ -1272,7 +1273,7 @@ pub const SessionManager = struct {
             .session_key = session_key,
             .provider = session.agent.default_provider,
             .model = session.agent.model_name,
-            .minutes_read_budget = minutes_read_budget,
+            .minutes_read_state = minutes_read_state,
             // Phase 5 T3 — propagate the per-turn Superpowers flag to tools.
             // spawn_many self-gates on this; a non-Superpowers turn cannot
             // fan out. (subagent_batch_result has no Superpowers gate since
@@ -2012,7 +2013,7 @@ test "owned session replies are cleared when their display lifetime ends" {
     allocator.free(reply);
 }
 
-test "Minutes budget is installed only for a registered foreground capability" {
+test "Minutes authorization state is installed only for a registered foreground capability" {
     const FakeMinutesTool = struct {
         pub const tool_name = tools_mod.minutes_read.MinutesReadTool.tool_name;
         pub const tool_description = "test Minutes capability";
@@ -2032,13 +2033,13 @@ test "Minutes budget is installed only for a registered foreground capability" {
     const tools = [_]Tool{minutes.tool()};
     const app_context = tools_mod.MessageTurnContext{ .channel = "zaki_app" };
     const telegram_context = tools_mod.MessageTurnContext{ .channel = "telegram" };
-    try testing.expect(shouldInstallMinutesReadBudget(&tools, .user, app_context));
-    try testing.expect(shouldInstallMinutesReadBudget(&tools, .mcp, app_context));
-    try testing.expect(!shouldInstallMinutesReadBudget(&tools, .heartbeat, app_context));
-    try testing.expect(!shouldInstallMinutesReadBudget(&tools, .scheduler, app_context));
-    try testing.expect(!shouldInstallMinutesReadBudget(&tools, .user, telegram_context));
-    try testing.expect(!shouldInstallMinutesReadBudget(&tools, .user, null));
-    try testing.expect(!shouldInstallMinutesReadBudget(&.{}, .user, app_context));
+    try testing.expect(shouldInstallMinutesReadState(&tools, .user, app_context));
+    try testing.expect(shouldInstallMinutesReadState(&tools, .mcp, app_context));
+    try testing.expect(!shouldInstallMinutesReadState(&tools, .heartbeat, app_context));
+    try testing.expect(!shouldInstallMinutesReadState(&tools, .scheduler, app_context));
+    try testing.expect(!shouldInstallMinutesReadState(&tools, .user, telegram_context));
+    try testing.expect(!shouldInstallMinutesReadState(&tools, .user, null));
+    try testing.expect(!shouldInstallMinutesReadState(&.{}, .user, app_context));
 }
 
 test "Minutes display-only outcome is not retained for session replay" {

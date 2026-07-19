@@ -394,7 +394,8 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     .{
         // Minutes carries transcript PII over a dedicated read-only plane.
         // It is intentionally not background-safe and remains serialized;
-        // every execution also requires the shared 8-call/1-MiB turn budget.
+        // every item/cursor execution also requires same-turn server-issued
+        // capability state.
         .name = minutes_read.MinutesReadTool.tool_name,
         .flags = .{ .read_only = true },
         .risk_level = .medium,
@@ -2007,39 +2008,48 @@ pub const EntryKind = enum {
     }
 };
 
-/// Shared, foreground-turn budget for sensitive Minutes reads. Runtime code
-/// creates one value per Agent turn and passes its pointer through
-/// `RuntimeTurnContext`; copied worker contexts therefore share the same
-/// mutex-protected counters instead of silently multiplying the allowance.
-pub const MinutesReadTurnBudget = struct {
-    pub const max_calls: u8 = 8;
-    pub const max_response_bytes: usize = 1024 * 1024;
+/// Shared authorization state for sensitive Minutes reads. Runtime code
+/// creates one value per eligible Agent turn and passes its pointer through
+/// `RuntimeTurnContext`; copied contexts therefore share the same set of
+/// server-issued item and cursor capabilities.
+pub const MinutesReadTurnState = struct {
     /// This consumer accepts at most 50 items from one validated index page,
     /// even though the spoke contract permits a larger server-side maximum.
-    /// Across the turn,
-    /// retain every page's issued capabilities so a caller can finish scanning
-    /// `updated_at` pagination before fetching the greatest `occurred_at`
-    /// candidate. The call budget makes this a hard 400-entry ceiling.
+    /// Keep a bounded digest-only working set for same-turn item authorization;
+    /// this is not a read-call or response-byte allowance. Storage grows only
+    /// with validated results and remains bounded by the Agent's ordinary turn
+    /// iteration policy plus each collection response's 50-item cap.
     pub const max_issued_items: usize = 50;
-    pub const max_turn_issued_items: usize = max_issued_items * @as(usize, max_calls);
     pub const CapabilityDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
+    const IssuedItem = struct {
+        digest: CapabilityDigest,
+        summary_eligible: bool,
+    };
+
+    allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
-    calls: u8 = 0,
-    response_bytes: usize = 0,
-    reserved_bytes: usize = 0,
     // Cross-spoke identifiers and cursors are capabilities. Keep only digests
     // so prompt-controlled plaintext cannot survive in turn state or logs.
-    issued_items: [max_turn_issued_items]CapabilityDigest = undefined,
-    issued_item_summary_eligible: [max_turn_issued_items]bool = undefined,
-    issued_item_count: usize = 0,
-    root_index_query: CapabilityDigest = undefined,
-    has_root_index_query: bool = false,
+    issued_items: std.ArrayListUnmanaged(IssuedItem) = .empty,
     issued_cursor: CapabilityDigest = undefined,
     issued_cursor_query: CapabilityDigest = undefined,
     has_issued_cursor: bool = false,
-    summary_fallback_item: CapabilityDigest = undefined,
-    has_summary_fallback_item: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) MinutesReadTurnState {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *MinutesReadTurnState) void {
+        if (self.issued_items.capacity > 0) {
+            std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.issued_items.allocatedSlice()));
+        }
+        self.issued_items.deinit(self.allocator);
+        self.issued_items = .empty;
+        std.crypto.secureZero(u8, &self.issued_cursor);
+        std.crypto.secureZero(u8, &self.issued_cursor_query);
+        self.has_issued_cursor = false;
+    }
 
     pub fn digestCapability(value: []const u8) CapabilityDigest {
         var digest: CapabilityDigest = undefined;
@@ -2059,46 +2069,39 @@ pub const MinutesReadTurnBudget = struct {
         return digest;
     }
 
-    /// The first cursorless index request establishes this turn's query. Exact
-    /// retries are allowed; changing `since` or effective `limit` after
-    /// untrusted Minutes data has entered the model is denied.
-    pub fn authorizeRootIndexQuery(self: *MinutesReadTurnBudget, index_query: CapabilityDigest) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (!self.has_root_index_query) {
-            self.root_index_query = index_query;
-            self.has_root_index_query = true;
-            return true;
-        }
-        return std.mem.eql(u8, &self.root_index_query, &index_query);
+    pub fn digestSearchQuery(query: []const u8, limit: i64) CapabilityDigest {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update("minutes-read-search-query-v1\x00");
+        const limit_bytes = std.mem.toBytes(limit);
+        hasher.update(&limit_bytes);
+        hasher.update(query);
+        var digest: CapabilityDigest = undefined;
+        hasher.final(&digest);
+        return digest;
     }
 
     /// Atomically accumulates capabilities from a fully validated index page.
     /// Callers pass digests, never server plaintext. Cursor authority remains
     /// single-step: only the newest page's cursor can advance pagination.
     pub fn retainIssuedCapabilities(
-        self: *MinutesReadTurnBudget,
+        self: *MinutesReadTurnState,
         item_digests: []const CapabilityDigest,
         item_summary_eligible: []const bool,
         next_cursor: ?CapabilityDigest,
         index_query: CapabilityDigest,
-    ) bool {
+    ) !void {
         std.debug.assert(item_digests.len <= max_issued_items);
         std.debug.assert(item_summary_eligible.len == item_digests.len);
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (!self.has_root_index_query or !std.mem.eql(u8, &self.root_index_query, &index_query)) {
-            return false;
-        }
-
-        // Capacity-check before mutation so a failed record cannot authorize a
+        // Reserve before mutation so allocation failure cannot authorize a
         // partial page that was never returned to the model.
         var new_item_count: usize = 0;
         for (item_digests, 0..) |candidate, candidate_index| {
             var already_issued = false;
-            for (self.issued_items[0..self.issued_item_count]) |issued| {
-                if (std.mem.eql(u8, &issued, &candidate)) {
+            for (self.issued_items.items) |issued| {
+                if (std.mem.eql(u8, &issued.digest, &candidate)) {
                     already_issued = true;
                     break;
                 }
@@ -2113,24 +2116,25 @@ pub const MinutesReadTurnBudget = struct {
             }
             if (!already_issued) new_item_count += 1;
         }
-        if (new_item_count > max_turn_issued_items - self.issued_item_count) return false;
+        try self.issued_items.ensureUnusedCapacity(self.allocator, new_item_count);
 
         for (item_digests, item_summary_eligible) |candidate, summary_eligible| {
             var existing_index: ?usize = null;
-            for (self.issued_items[0..self.issued_item_count], 0..) |issued, index| {
-                if (std.mem.eql(u8, &issued, &candidate)) {
+            for (self.issued_items.items, 0..) |issued, index| {
+                if (std.mem.eql(u8, &issued.digest, &candidate)) {
                     existing_index = index;
                     break;
                 }
             }
             if (existing_index) |index| {
                 // Seeing validated transcript metadata on any page is enough
-                // to permit the one-shot, response-validated summary fallback.
-                self.issued_item_summary_eligible[index] = self.issued_item_summary_eligible[index] or summary_eligible;
+                // to permit a response-validated summary read.
+                self.issued_items.items[index].summary_eligible = self.issued_items.items[index].summary_eligible or summary_eligible;
             } else {
-                self.issued_items[self.issued_item_count] = candidate;
-                self.issued_item_summary_eligible[self.issued_item_count] = summary_eligible;
-                self.issued_item_count += 1;
+                self.issued_items.appendAssumeCapacity(.{
+                    .digest = candidate,
+                    .summary_eligible = summary_eligible,
+                });
             }
         }
         if (next_cursor) |digest| {
@@ -2140,11 +2144,9 @@ pub const MinutesReadTurnBudget = struct {
         } else {
             self.has_issued_cursor = false;
         }
-        self.has_summary_fallback_item = false;
-        return true;
     }
 
-    pub fn isCursorIssued(self: *MinutesReadTurnBudget, cursor: []const u8, index_query: CapabilityDigest) bool {
+    pub fn isCursorIssued(self: *MinutesReadTurnState, cursor: []const u8, index_query: CapabilityDigest) bool {
         const cursor_digest = digestCapability(cursor);
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2153,84 +2155,23 @@ pub const MinutesReadTurnBudget = struct {
             std.mem.eql(u8, &self.issued_cursor_query, &index_query);
     }
 
-    /// Full item reads require an ID from a validated index page in this turn.
-    /// A summary retry additionally consumes the one-shot grant created by a
-    /// bounded full-item failure.
-    pub fn authorizeItemRequest(self: *MinutesReadTurnBudget, item_id: []const u8, summary_retry: bool) bool {
+    /// Item reads require an ID from a validated collection page in this turn.
+    /// Summary reads additionally require that page to identify the item as a
+    /// transcript; the returned body is still sealed-profile validated.
+    pub fn authorizeItemRequest(self: *MinutesReadTurnState, item_id: []const u8, summary_variant: bool) bool {
         const digest = digestCapability(item_id);
         self.mutex.lock();
         defer self.mutex.unlock();
 
         var issued_item_index: ?usize = null;
-        for (self.issued_items[0..self.issued_item_count], 0..) |issued, index| {
-            if (std.mem.eql(u8, &issued, &digest)) {
+        for (self.issued_items.items, 0..) |issued, index| {
+            if (std.mem.eql(u8, &issued.digest, &digest)) {
                 issued_item_index = index;
                 break;
             }
         }
         const item_index = issued_item_index orelse return false;
-        if (!summary_retry) return true;
-        if (!self.issued_item_summary_eligible[item_index]) return false;
-        if (!self.has_summary_fallback_item or !std.mem.eql(u8, &self.summary_fallback_item, &digest)) return false;
-        self.has_summary_fallback_item = false;
-        return true;
-    }
-
-    pub fn grantSummaryFallback(self: *MinutesReadTurnBudget, item_id: []const u8) bool {
-        const digest = digestCapability(item_id);
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        for (self.issued_items[0..self.issued_item_count], 0..) |issued, index| {
-            if (std.mem.eql(u8, &issued, &digest)) {
-                if (!self.issued_item_summary_eligible[index]) return false;
-                self.summary_fallback_item = digest;
-                self.has_summary_fallback_item = true;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    pub const Reservation = struct {
-        budget: *MinutesReadTurnBudget,
-        allowance: usize,
-        finished: bool = false,
-
-        pub fn finish(self: *Reservation, actual_bytes: usize) !void {
-            if (self.finished) return error.MinutesReadReservationFinished;
-            self.budget.mutex.lock();
-            defer self.budget.mutex.unlock();
-            self.finished = true;
-
-            if (self.budget.reserved_bytes < self.allowance) return error.MinutesReadBudgetCorrupt;
-            self.budget.reserved_bytes -= self.allowance;
-            if (actual_bytes > self.allowance or actual_bytes > max_response_bytes -| self.budget.response_bytes) {
-                self.budget.response_bytes = max_response_bytes;
-                return error.MinutesReadResponseBudgetExhausted;
-            }
-            self.budget.response_bytes += actual_bytes;
-        }
-    };
-
-    pub fn reserveCall(self: *MinutesReadTurnBudget, per_response_cap: usize) !Reservation {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.calls >= max_calls) return error.MinutesReadCallBudgetExhausted;
-        if (self.response_bytes > max_response_bytes or self.reserved_bytes > max_response_bytes -| self.response_bytes) {
-            return error.MinutesReadResponseBudgetExhausted;
-        }
-        const remaining = max_response_bytes - self.response_bytes - self.reserved_bytes;
-        if (remaining == 0) return error.MinutesReadResponseBudgetExhausted;
-        const allowance = @min(per_response_cap, remaining);
-        self.calls += 1;
-        self.reserved_bytes += allowance;
-        return .{ .budget = self, .allowance = allowance };
-    }
-
-    pub fn snapshot(self: *MinutesReadTurnBudget) struct { calls: u8, response_bytes: usize, reserved_bytes: usize } {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return .{ .calls = self.calls, .response_bytes = self.response_bytes, .reserved_bytes = self.reserved_bytes };
+        return !summary_variant or self.issued_items.items[item_index].summary_eligible;
     }
 };
 
@@ -2246,7 +2187,7 @@ pub const RuntimeTurnContext = struct {
     /// Present only on a foreground turn whose runtime is prepared to expose
     /// `minutes_read`. Null fails closed inside the tool even if registration
     /// or dispatch policy is accidentally bypassed.
-    minutes_read_budget: ?*MinutesReadTurnBudget = null,
+    minutes_read_state: ?*MinutesReadTurnState = null,
     /// Per-session billing + capability state. Default construction gives
     /// "pro active unlimited" so existing tests + un-plumbed call paths
     /// keep working. S2.1 (BFF provision response extension) installs the
@@ -2537,8 +2478,8 @@ pub fn toolBlockedForCurrentTurnWithMeta(
     const policy = backgroundPolicyForOrigin(turn_ctx.origin);
 
     // Transcript metadata/content is user-request-only even though the tool is
-    // read-only. Heartbeat/scheduler/wake/proactive lanes must not spend its PII
-    // budget or ingest meeting content without an active foreground request.
+    // read-only. Heartbeat/scheduler/wake/proactive lanes must not read or
+    // ingest meeting content without an active foreground request.
     if (std.mem.eql(u8, tool_name, minutes_read.MinutesReadTool.tool_name)) {
         return "Minutes reads are disabled for background turns";
     }
