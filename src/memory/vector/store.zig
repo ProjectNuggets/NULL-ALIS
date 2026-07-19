@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const meeting_memory = @import("../../meeting_memory.zig");
 const Allocator = std.mem.Allocator;
 const vector = @import("math.zig");
 const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
@@ -110,6 +111,9 @@ pub const VectorStore = struct {
     }
 
     pub fn upsertScoped(self: VectorStore, scope_user_id: ?i64, key: []const u8, embedding: []const f32) !void {
+        if (std.mem.startsWith(u8, key, meeting_memory.memory_key_prefix)) {
+            return error.MeetingDerivedMemoryEmbeddingForbidden;
+        }
         return self.vtable.upsert(self.ptr, scope_user_id, key, embedding);
     }
 
@@ -527,6 +531,58 @@ pub const SqliteSidecarVectorStore = struct {
 };
 
 // ── Tests ─────────────────────────────────────────────────────────
+
+const RecordingVectorBackend = struct {
+    upsert_calls: usize = 0,
+
+    const Self = @This();
+
+    fn store(self: *Self) VectorStore {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable_instance };
+    }
+
+    fn implUpsert(ptr: *anyopaque, _: ?i64, _: []const u8, _: []const f32) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.upsert_calls += 1;
+    }
+
+    fn implSearch(_: *anyopaque, alloc: Allocator, _: ?i64, _: []const f32, _: u32) anyerror![]VectorResult {
+        return alloc.alloc(VectorResult, 0);
+    }
+
+    fn implDelete(_: *anyopaque, _: ?i64, _: []const u8) anyerror!void {}
+    fn implDeleteAllForUser(_: *anyopaque, _: i64) anyerror!usize {
+        return 0;
+    }
+    fn implCount(_: *anyopaque) anyerror!usize {
+        return 0;
+    }
+    fn implHealthCheck(_: *anyopaque, _: Allocator) anyerror!HealthStatus {
+        return .{ .ok = true, .latency_ns = 0, .entry_count = 0, .error_msg = null };
+    }
+    fn implDeinit(_: *anyopaque) void {}
+
+    const vtable_instance = VectorStore.VTable{
+        .upsert = &implUpsert,
+        .search = &implSearch,
+        .delete = &implDelete,
+        .delete_all_for_user = &implDeleteAllForUser,
+        .count = &implCount,
+        .health_check = &implHealthCheck,
+        .deinit = &implDeinit,
+    };
+};
+
+test "VectorStore rejects meeting-derived upserts before the backend boundary" {
+    var backend = RecordingVectorBackend{};
+    const store = backend.store();
+
+    try std.testing.expectError(
+        error.MeetingDerivedMemoryEmbeddingForbidden,
+        store.upsertScoped(42, "meeting_ingest/not-yet-validated", &[_]f32{ 1.0, 0.0 }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), backend.upsert_calls);
+}
 
 test "init with in-memory sqlite" {
     var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");

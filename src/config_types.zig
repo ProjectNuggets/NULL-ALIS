@@ -1526,10 +1526,28 @@ pub const StatePostgresConfig = struct {
     lock_timeout_ms: u32 = 2000,
 };
 
+/// Operator-only env indirection for Minutes memory cryptography. These are
+/// env-var names, never secret material and never user/tenant preferences.
+pub const MeetingMemoryCryptoConfig = struct {
+    /// Environment variable containing at least 32 bytes of pseudonym-key
+    /// material. Both secret variables absent keeps Minutes memory off; only
+    /// one present is a fail-closed boot error.
+    pseudonym_key_env: []const u8 = "NULLALIS_MINUTES_MEMORY_PSEUDONYM_KEY",
+    /// Environment variable containing at least 32 bytes of seed material for
+    /// the current Ed25519 receipt signer.
+    receipt_signing_seed_env: []const u8 = "NULLALIS_MINUTES_MEMORY_RECEIPT_SIGNING_SEED",
+    /// Optional env-var name containing a secondary Ed25519 public key. Use the
+    /// next key during rotation phase one and the prior key during phase two so
+    /// old/new pods verify each other. No secondary private seed is loaded.
+    /// Runtime boot also refuses to retire any still-retained receipt key.
+    receipt_secondary_public_key_env: ?[]const u8 = null,
+};
+
 pub const StateConfig = struct {
     backend: []const u8 = "file",
     postgres: StatePostgresConfig = .{},
     secrets: StateSecretsStoreConfig = .{},
+    meeting_memory_crypto: MeetingMemoryCryptoConfig = .{},
 };
 
 // ── Composio config ─────────────────────────────────────────────
