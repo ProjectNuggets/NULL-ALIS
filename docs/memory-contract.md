@@ -44,7 +44,7 @@ enforced in extraction-builder tests inside `src/agent/extraction/runner.zig`.)
 | `.tool` result from `memory_doctor`, `memory_maintain`, `brain_graph`, `context_snapshot`, `trace_query`, `runtime_info`, `memory_list`, `memory_timeline`, `transcript_read` [E] | bookkeeping | dropped by exact tool identity |
 | `.tool` result from data tools (`web_search`, `web_fetch`, `file_read`, …) [E] | knowledge (candidate) | extracted |
 | `.tool` result, `name == null` [E] | unknown | fail-open: extracted |
-| Entity named in `scaffold_entity_names` at persist boundary | bookkeeping | write rejected (denylist backstop) |
+| Entity named in `scaffold_entity_names` at persist boundary | bookkeeping | write rejected (denylist backstop); the exact normalized set combines stable scaffold titles, curated Brain-Architecture body terms, and every canonical memory link type |
 | Extracted predicate `NO_CONNECTION_FOUND`, `DESCRIPTION` | bookkeeping | whole extracted fact rejected before memory/entity/edge persistence (non-relational sentinel output, not user/world knowledge) |
 | Content containing a runtime-owned assistant scaffold fence | bookkeeping | `containsAssistantScaffold` rejects the entire write before persistence; `memory_store` returns a user-safe failure and the Postgres manager returns `error.AssistantScaffoldRejected` on simple + metadata paths |
 | `memory_store` (inline path) with a scaffold-entity, system-managed, default-hidden-bookkeeping, or >255-byte key | bookkeeping | tool call rejected with redirect message (`inlineKeyGuard`); the unified-triple path is exempt — it derives its own `extracted_<hash>` key and ignores the caller's |
@@ -64,7 +64,7 @@ are deliberately omitted: they rot on unrelated edits; symbols survive refactors
 
 - Role filter (keystone): `src/agent/extraction/runner.zig` `buildEpisodeTranscript` / `buildTranscript`
 - Tool-identity filter: `runner.zig` `internal_extraction_tool_names` (pub = test-only surface) + `isInternalExtractionToolName`
-- Entity denylist: `src/agent/context_builder.zig` `scaffold_entity_names` (comptime drift-guarded vs `stable_prompt_markers`; normalized forms precomputed at comptime)
+- Entity denylist: `src/agent/context_builder.zig` `scaffold_entity_names` (titles are comptime drift-guarded vs `stable_prompt_markers`; link names derive from leaf `src/memory/link_types.zig` `ALL_LINK_TYPES` and remain re-exported by `memory/root.zig`; normalized forms are precomputed at comptime)
 - Extraction predicate denylist: `src/agent/extraction_persist.zig` `REJECTED_PREDICATES` / `isRejectedPredicate`
 - Key predicates: `src/memory/root.zig` — `isInternalMemoryKey`, `isContinuityArtifactKey`, `isContinuitySummaryKey`, `isDefaultHiddenMemoryKey`, `isBrainVisibleKey`, `BRAIN_HIDDEN_PREFIXES` / `BRAIN_HIDDEN_EXACT_KEYS`, `isSemanticBookkeepingKey`, `shouldEmbedMemoryEntry`, `isTombstoneKey`, `isAppendOnlyMemoryKey`, `isSystemManagedMemoryKey`, `isMutableMemoryEntry`, `isEditableMemoryEntry`
 - Scaffold-content predicate: `src/memory/root.zig` `containsAssistantScaffold`; enforced by the shared `Memory.store` / `storeWithMetadata` facade, agent-facing store/edit/compose tools, and every Postgres manager path that can accept caller-authored replacement content before database work
