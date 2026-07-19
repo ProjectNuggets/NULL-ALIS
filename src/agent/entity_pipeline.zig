@@ -520,6 +520,18 @@ pub fn extractMentions(
     }
 
     const raw = resp.contentOrEmpty();
+    if (std.mem.trim(u8, raw, " \t\r\n").len == 0) {
+        const reasoning_len = if (resp.reasoning_content) |reasoning| reasoning.len else 0;
+        log.warn(
+            "entity_pipeline: blank structured content content_len={d} reasoning_len={d}",
+            .{ raw.len, reasoning_len },
+        );
+        return ExtractResult{
+            .mentions = try allocator.alloc(EntityMention, 0),
+            .outcome = .parse_failed,
+            .llm_latency_ms = t_end - t_start,
+        };
+    }
     const mentions = parseMentionsJson(allocator, raw) catch |err| {
         log.warn("entity_pipeline: parse failed err={s} raw_len={d}", .{ @errorName(err), raw.len });
         return ExtractResult{
@@ -983,6 +995,61 @@ pub fn runOnTurn(
 // ─────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────
+
+test "extractMentions treats blank structured content as parse_failed" {
+    const BlankContentProvider = struct {
+        fn chatWithSystem(_: *anyopaque, _: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const model = try allocator.dupe(u8, "reasoning-model");
+            errdefer allocator.free(model);
+            const reasoning = try allocator.dupe(u8, "internal reasoning must not be parsed as JSON");
+            return .{
+                .content = null,
+                .model = model,
+                .reasoning_content = reasoning,
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "blank-content-test";
+        }
+
+        fn deinit(_: *anyopaque) void {}
+
+        const vtable = Provider.VTable{
+            .chatWithSystem = chatWithSystem,
+            .chat = chat,
+            .supportsNativeTools = supportsNativeTools,
+            .getName = getName,
+            .deinit = deinit,
+        };
+
+        fn provider(self: *@This()) Provider {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_impl = BlankContentProvider{};
+    const result = try extractMentions(
+        allocator,
+        provider_impl.provider(),
+        "reasoning-model",
+        "Nova builds nullALIS in Berlin.",
+        1,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(RunOutcome.parse_failed, result.outcome);
+    try std.testing.expectEqual(@as(usize, 0), result.mentions.len);
+}
 
 test "corefDecision — cascade: high cosine merges, ambiguous band needs containment" {
     // High cosine → merge regardless of names.

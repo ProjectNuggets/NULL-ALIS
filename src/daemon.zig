@@ -1062,9 +1062,11 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
     // model), the worker tick is a no-op and trigger sites continue
     // running inline (V1.12 fallback).
     //
-    // Provider: same RuntimeProviderBundle the agent path uses (Kimi
-    // K2.6 via Together by default). The bundle is heap-allocated so
-    // we can pass a stable Provider interface to processOneExtractionJob.
+    // Provider: same RuntimeProviderBundle the agent path uses. Structured
+    // extraction prefers its matched sidecar provider/model pair, falling
+    // back to the primary provider with the judge override/default model.
+    // The bundle is heap-allocated so the selected Provider interface stays
+    // valid for processOneExtractionJob over the heartbeat thread lifetime.
     //
     // Embedder: created via the same factory memory_runtimes use
     // (createEmbeddingProvider). Together-hosted bge-large by default.
@@ -1073,6 +1075,7 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
         b.deinit();
         allocator.destroy(b);
     };
+    var worker_extraction: ?ExtractionProviderModel = null;
     // HI-02 fix: collapsed redundant inner check. EmbeddingProvider.deinit
     // consumes self by value via the vtable; one captured deinit suffices.
     var worker_embedder: ?embeddings.EmbeddingProvider = null;
@@ -1111,6 +1114,13 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
             break :init_worker;
         };
         worker_provider_bundle = bundle_ptr;
+        worker_extraction = selectExtractionProviderModel(
+            bundle_ptr.provider(),
+            bundle_ptr.sidecarProvider(),
+            bundle_ptr.sidecarModelName(),
+            config.agent.extraction_judge_model,
+            config.default_model orelse "moonshotai/Kimi-K2.6",
+        );
 
         // Resolve embedding provider api_key from config.providers list
         // OR env var fallback (same logic memory/root.zig::resolveEmbeddingApiKey
@@ -1150,9 +1160,15 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
             };
             if (ep) |e| {
                 worker_embedder = e;
+                const extraction = worker_extraction.?;
                 log.info(
-                    "extraction_queue.worker.ready embed_provider={s} embed_model={s}",
-                    .{ embed_provider_name, config.memory.search.model },
+                    "extraction_queue.worker.ready extract_provider={s} extract_model={s} embed_provider={s} embed_model={s}",
+                    .{
+                        extraction.provider.getName(),
+                        extraction.model,
+                        embed_provider_name,
+                        config.memory.search.model,
+                    },
                 );
             }
         }
@@ -1207,7 +1223,7 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
         // turn loop already returned in <5ms (enqueue-only on producer
         // side once the trigger sites are cut over).
         if (pg_mgr) |worker_mgr| {
-            if (worker_provider_bundle) |bundle| {
+            if (worker_extraction) |extraction| {
                 if (worker_embedder) |embedder| {
                     var jobs_processed: usize = 0;
                     // HI-04 fix: dropped 5 → 2. Worst-case worker tick
@@ -1229,7 +1245,8 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
                             allocator,
                             config,
                             worker_mgr,
-                            bundle.provider(),
+                            extraction.provider,
+                            extraction.model,
                             embedder,
                             &extraction_breaker,
                         ) catch |err| blk: {
@@ -1319,6 +1336,32 @@ const ExtractionBreaker = struct {
     }
 };
 
+const ExtractionProviderModel = struct {
+    provider: providers.Provider,
+    model: []const u8,
+};
+
+/// Select structured extraction as one provider/model pair. A sidecar is
+/// usable only when both halves are configured; otherwise keep the primary
+/// provider paired with the judge override or the primary default model.
+fn selectExtractionProviderModel(
+    primary_provider: providers.Provider,
+    sidecar_provider: ?providers.Provider,
+    sidecar_model: []const u8,
+    extraction_judge_model: []const u8,
+    default_model: []const u8,
+) ExtractionProviderModel {
+    if (sidecar_provider) |provider| {
+        if (sidecar_model.len > 0) {
+            return .{ .provider = provider, .model = sidecar_model };
+        }
+    }
+    return .{
+        .provider = primary_provider,
+        .model = if (extraction_judge_model.len > 0) extraction_judge_model else default_model,
+    };
+}
+
 /// V1.13 Day 2.2 — process one extraction job from the queue. Returns
 /// true when a job was processed (drain loop continues), false when
 /// queue empty (drain loop stops). All errors are failure-soft.
@@ -1355,6 +1398,7 @@ fn processOneExtractionJob(
     config: *const Config,
     state_mgr: *zaki_state.Manager,
     provider: providers.Provider,
+    model_name: []const u8,
     embedder: embeddings.EmbeddingProvider,
     breaker: ?*ExtractionBreaker,
 ) !bool {
@@ -1469,7 +1513,6 @@ fn processOneExtractionJob(
         return true;
     }
 
-    const model_name = config.default_model orelse "moonshotai/Kimi-K2.6";
     // V1.14.3 (G-03 closure) — Pass the job's session_id as the episode
     // anchor for all edges emitted from this job. The daemon already
     // holds `job.session_id` per the ExtractionJob struct (V1.13 schema).
@@ -4474,6 +4517,76 @@ test "P1-6 extractionOutcomeTripsBreaker — only llm_failed counts as an extrac
     try std.testing.expect(!extractionOutcomeTripsBreaker(.ok));
     try std.testing.expect(!extractionOutcomeTripsBreaker(.parse_failed));
     try std.testing.expect(extractionOutcomeTripsBreaker(.llm_failed));
+}
+
+test "extraction worker keeps provider and model selection paired" {
+    const NamedProvider = struct {
+        name: []const u8,
+
+        fn chatWithSystem(_: *anyopaque, _: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.UnexpectedTestCall;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(ptr: *anyopaque) []const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.name;
+        }
+
+        fn deinit(_: *anyopaque) void {}
+
+        const vtable = providers.Provider.VTable{
+            .chatWithSystem = chatWithSystem,
+            .chat = chat,
+            .supportsNativeTools = supportsNativeTools,
+            .getName = getName,
+            .deinit = deinit,
+        };
+
+        fn provider(self: *@This()) providers.Provider {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+    };
+
+    var primary = NamedProvider{ .name = "moonshot" };
+    var sidecar = NamedProvider{ .name = "together" };
+    const selected = selectExtractionProviderModel(
+        primary.provider(),
+        sidecar.provider(),
+        "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "legacy-judge-model",
+        "moonshotai/Kimi-K2.6",
+    );
+
+    try std.testing.expectEqualStrings("together", selected.provider.getName());
+    try std.testing.expectEqualStrings("meta-llama/Llama-3.3-70B-Instruct-Turbo", selected.model);
+
+    const judge_selected = selectExtractionProviderModel(
+        primary.provider(),
+        sidecar.provider(),
+        "",
+        "judge-instruct-model",
+        "moonshotai/Kimi-K2.6",
+    );
+    try std.testing.expectEqualStrings("moonshot", judge_selected.provider.getName());
+    try std.testing.expectEqualStrings("judge-instruct-model", judge_selected.model);
+
+    const default_selected = selectExtractionProviderModel(
+        primary.provider(),
+        null,
+        "",
+        "",
+        "moonshotai/Kimi-K2.6",
+    );
+    try std.testing.expectEqualStrings("moonshot", default_selected.provider.getName());
+    try std.testing.expectEqualStrings("moonshotai/Kimi-K2.6", default_selected.model);
 }
 
 test "P1-6 extractor breaker — opens after N consecutive failures, skips during cooldown, half-opens, recovers" {
