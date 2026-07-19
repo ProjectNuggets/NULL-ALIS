@@ -16,9 +16,9 @@
 //!
 //! ## Pipeline (each ExtractedMemory)
 //!
-//! 1. **Graph suppression heuristics** — retain facts whose `predicate` is
-//!    in the rejected-predicate set for audit/recall, but do not resolve
-//!    endpoints or materialize graph edges for them.
+//! 1. **Predicate policy** — fully reject conversational meta-narrative;
+//!    retain only non-relational classifier sentinels under an internal,
+//!    non-embedded audit key with no endpoint or edge materialization.
 //! 2. **SHA-256 content_hash dedup** — if a memory with identical
 //!    normalized content already exists for this user, skip silently
 //!    (Mem0-style pre-filter, gap #13 from audit). Previously used MD5
@@ -186,6 +186,7 @@ test "parseValidAtIso returns null on too-short input" {
 
 pub const PersistResult = struct {
     written_count: usize,
+    skipped_rejected_predicate: usize,
     suppressed_predicate_graph: usize,
     skipped_md5_dup: usize,
     skipped_cosine_dup: usize,
@@ -201,8 +202,8 @@ pub const PersistResult = struct {
     contradictions_resolved: usize = 0,
     /// Brain-leak Fix A — facts rejected because their subject OR object is a
     /// system-prompt scaffold artifact (`isRejectedEntityName`). Distinct from
-    /// `suppressed_predicate_graph` so observability can tell a preserved
-    /// fact with no graph materialization from a fully rejected scaffold fact.
+    /// `suppressed_predicate_graph` so observability can tell an internal
+    /// audit-only sentinel from a fully rejected scaffold fact.
     skipped_scaffold: usize = 0,
     failed_count: usize,
 };
@@ -301,8 +302,6 @@ const REJECTED_PREDICATES = [_][]const u8{
     "IS_UNKNOWN",
     "EXPRESSED_READINESS",
     "INITIATED_CONVERSATION",
-    "NO_CONNECTION_FOUND",
-    "DESCRIPTION",
     // P7 — entity_pipeline speaker hub predicate (RENAMED from "MENTIONED").
     // Keep it rejected at this write-time defense-in-depth filter too, so the
     // gateway blacklist (gateway.isRejectedExtractionPredicate) and this list
@@ -310,9 +309,27 @@ const REJECTED_PREDICATES = [_][]const u8{
     "USER_MENTIONED",
 };
 
+/// Non-relational classifier sentinels that are useful for operator audit but
+/// are not graph knowledge. Unlike conversational meta-narrative predicates,
+/// these may retain a bookkeeping fact; endpoint resolution and edge writes
+/// are always suppressed.
+const AUDIT_ONLY_PREDICATES = [_][]const u8{
+    "NO_CONNECTION_FOUND",
+    "DESCRIPTION",
+};
+
 inline fn isRejectedPredicate(predicate: []const u8) bool {
+    const normalized = std.mem.trim(u8, predicate, &std.ascii.whitespace);
     for (REJECTED_PREDICATES) |p| {
-        if (std.mem.eql(u8, p, predicate)) return true;
+        if (std.ascii.eqlIgnoreCase(p, normalized)) return true;
+    }
+    return false;
+}
+
+inline fn isAuditOnlyPredicate(predicate: []const u8) bool {
+    const normalized = std.mem.trim(u8, predicate, &std.ascii.whitespace);
+    for (AUDIT_ONLY_PREDICATES) |p| {
+        if (std.ascii.eqlIgnoreCase(p, normalized)) return true;
     }
     return false;
 }
@@ -783,6 +800,21 @@ pub fn deriveExtractionKey(
     return std.fmt.allocPrint(allocator, "extracted_{s}", .{hex_buf});
 }
 
+fn deriveAuditOnlyKey(
+    allocator: std.mem.Allocator,
+    subject: []const u8,
+    predicate: []const u8,
+    object: []const u8,
+) ![]u8 {
+    const canonical_key = try deriveExtractionKey(allocator, subject, predicate, object);
+    defer allocator.free(canonical_key);
+    return std.fmt.allocPrint(
+        allocator,
+        "audit_shell/extraction_sentinel/{s}",
+        .{canonical_key["extracted_".len..]},
+    );
+}
+
 /// Build the metadata JSON for an extracted memory. Format:
 ///   {
 ///     "subject": "...",
@@ -805,6 +837,7 @@ fn buildExtractionMetadata(
     allocator: std.mem.Allocator,
     mem: ExtractedMemory,
     origin: WriteOrigin,
+    attribution: []const u8,
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .{};
     errdefer buf.deinit(allocator);
@@ -818,7 +851,9 @@ fn buildExtractionMetadata(
     try writeJsonEscaped(w, mem.object);
     try w.writeAll("\",\"attributed_to\":\"");
     try writeJsonEscaped(w, mem.attributed_to);
-    try w.writeAll("\",\"attribution\":\"extraction_classifier\"");
+    try w.writeAll("\",\"attribution\":\"");
+    try writeJsonEscaped(w, attribution);
+    try w.writeAll("\"");
     // V1.14.12 (M3) — write_origin enables the coverage filter to
     // identify agent-tool writes via SQL `metadata->>'write_origin'`.
     try w.writeAll(",\"write_origin\":\"");
@@ -1436,6 +1471,7 @@ pub fn persistExtracted(
 ) !PersistResult {
     var result = PersistResult{
         .written_count = 0,
+        .skipped_rejected_predicate = 0,
         .suppressed_predicate_graph = 0,
         .skipped_md5_dup = 0,
         .skipped_cosine_dup = 0,
@@ -1450,8 +1486,8 @@ pub fn persistExtracted(
     // V1.14.12 (M1 review MEDIUM#2) — renamed `count` → `attempted` to
     // reflect that this is INPUT cardinality, not write cardinality.
     // MD5 + cardinality fast-path + judge skips can all reduce attempted →
-    // written. Predicate graph suppression is orthogonal: the fact is written,
-    // but no entity/edge is materialized.
+    // written. Audit-only predicate suppression is orthogonal: the internal
+    // bookkeeping row is written, but no entity/edge is materialized.
     log.info(
         "memory.write.batch origin={s} attempted={d} user_id={d} session={s} judge={s}",
         .{
@@ -1464,12 +1500,20 @@ pub fn persistExtracted(
     );
 
     for (memories) |m| {
-        // Step 1: predicate graph blacklist. Preserve the durable fact so an
-        // operator can audit/curate classifier output, but never resolve its
-        // endpoints or materialize an edge from a non-relational sentinel.
-        const suppress_graph = isRejectedPredicate(m.predicate);
-        if (suppress_graph) {
+        // Step 1a: conversational meta-narrative is not user/world knowledge.
+        // Preserve the historical fail-closed behavior: no memory, entity,
+        // edge, embedding, or recall candidate is created.
+        if (isRejectedPredicate(m.predicate)) {
             log.warn("extraction.rejected_predicate predicate={s} subject={s}", .{ m.predicate, m.subject });
+            result.skipped_rejected_predicate += 1;
+            continue;
+        }
+
+        // Step 1b: non-relational classifier sentinels may be retained for
+        // operator audit, but never resolve endpoints or materialize edges.
+        const suppress_graph = isAuditOnlyPredicate(m.predicate);
+        if (suppress_graph) {
+            log.warn("extraction.audit_only_predicate predicate={s} subject={s}", .{ m.predicate, m.subject });
             result.suppressed_predicate_graph += 1;
         }
 
@@ -1485,6 +1529,43 @@ pub fn persistExtracted(
                 .{ m.subject, m.predicate, m.object },
             );
             result.skipped_scaffold += 1;
+            continue;
+        }
+
+        // Audit-only sentinels bypass the knowledge pipeline entirely. Their
+        // internal key keeps them hidden from Brain/default recall and makes
+        // shouldEmbedMemoryEntry reject vector sync; bypassing the judge also
+        // prevents diagnostic output from closing or deduplicating real facts.
+        if (suppress_graph) {
+            const audit_key = deriveAuditOnlyKey(allocator, m.subject, m.predicate, m.object) catch |err| {
+                log.warn("extraction.audit_key_derivation_failed err={s}", .{@errorName(err)});
+                result.failed_count += 1;
+                continue;
+            };
+            defer allocator.free(audit_key);
+
+            const audit_metadata = buildExtractionMetadata(allocator, m, origin, "extraction_audit") catch |err| {
+                log.warn("extraction.audit_metadata_build_failed err={s}", .{@errorName(err)});
+                result.failed_count += 1;
+                continue;
+            };
+            defer allocator.free(audit_metadata);
+
+            state_mgr.upsertMemoryWithMetadataAndEventType(
+                user_id,
+                audit_key,
+                m.text,
+                .daily,
+                session_id,
+                audit_metadata,
+                "extraction_audit",
+            ) catch |err| {
+                log.warn("extraction.audit_write_failed key={s} err={s}", .{ audit_key, @errorName(err) });
+                result.failed_count += 1;
+                continue;
+            };
+
+            result.written_count += 1;
             continue;
         }
 
@@ -1664,7 +1745,7 @@ pub fn persistExtracted(
         };
         defer allocator.free(key);
 
-        const metadata_json = buildExtractionMetadata(allocator, m, origin) catch |err| {
+        const metadata_json = buildExtractionMetadata(allocator, m, origin, "extraction_classifier") catch |err| {
             log.warn("extraction.metadata_build_failed err={s}", .{@errorName(err)});
             result.failed_count += 1;
             continue;
@@ -1889,11 +1970,12 @@ pub fn persistExtracted(
     // WRITTEN counts (not attempted) to decide whether direct paths
     // are subsumed by extract paths.
     log.info(
-        "memory.write.batch_done origin={s} attempted={d} written={d} skipped_md5={d} skipped_semantic={d} suppressed_predicate_graph={d} skipped_scaffold={d} contradictions={d} failed={d}",
+        "memory.write.batch_done origin={s} attempted={d} written={d} skipped_rejected_predicate={d} skipped_md5={d} skipped_semantic={d} suppressed_predicate_graph={d} skipped_scaffold={d} contradictions={d} failed={d}",
         .{
             origin.toSlice(),
             memories.len,
             result.written_count,
+            result.skipped_rejected_predicate,
             result.skipped_md5_dup,
             result.skipped_semantic_dup,
             result.suppressed_predicate_graph,
@@ -2239,12 +2321,17 @@ test "parseExtractedJson skips text shorter than 3 chars" {
     try std.testing.expectEqual(@as(usize, 1), out.len);
 }
 
-test "isRejectedPredicate covers known meta-narrative predicates" {
+test "predicate policy separates rejected meta-narrative from audit-only sentinels" {
     try std.testing.expect(isRejectedPredicate("GREETED"));
+    try std.testing.expect(isRejectedPredicate(" greeted\t"));
     try std.testing.expect(isRejectedPredicate("SAID"));
     try std.testing.expect(isRejectedPredicate("ACKNOWLEDGED"));
-    try std.testing.expect(isRejectedPredicate("NO_CONNECTION_FOUND"));
-    try std.testing.expect(isRejectedPredicate("DESCRIPTION"));
+    try std.testing.expect(!isRejectedPredicate("NO_CONNECTION_FOUND"));
+    try std.testing.expect(!isRejectedPredicate("DESCRIPTION"));
+    try std.testing.expect(isAuditOnlyPredicate("NO_CONNECTION_FOUND"));
+    try std.testing.expect(isAuditOnlyPredicate("DESCRIPTION"));
+    try std.testing.expect(isAuditOnlyPredicate(" description "));
+    try std.testing.expect(!isAuditOnlyPredicate("GREETED"));
     try std.testing.expect(!isRejectedPredicate("PREFERS"));
     try std.testing.expect(!isRejectedPredicate("DEPLOYS_TO"));
     try std.testing.expect(!isRejectedPredicate("BIRTHDAY"));

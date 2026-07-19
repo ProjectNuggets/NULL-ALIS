@@ -5885,8 +5885,9 @@ const ManagerImpl = struct {
 
     /// V1.6 commit 5b.3 (WR-1): SHA-256 content_hash dedup pre-filter for
     /// extraction-derived writes. Returns the existing memory row if
-    /// the user already has a memory with identical normalized content,
-    /// or null otherwise.
+    /// the user already has a Brain-visible memory with identical normalized
+    /// content, or null otherwise. Hidden bookkeeping rows must not suppress
+    /// a later legitimate knowledge fact with the same text.
     ///
     /// Uses `idx_memories_hash ON (user_id, content_hash)` directly —
     /// O(1) hashtable index probe per call. Critical for V1.6
@@ -5895,8 +5896,9 @@ const ManagerImpl = struct {
     /// atomic facts. Without this guard, brain page accumulates
     /// duplicates after 5-10 compactions.
     ///
-    /// Skips superseded entries (MEMORIES_VALIDITY_FILTER) so a
-    /// previously-retired fact doesn't block a fresh re-extraction.
+    /// Skips hidden/internal keys (BRAIN_USER_KEY_FILTER) and superseded
+    /// entries (MEMORIES_VALIDITY_FILTER), so neither bookkeeping nor a
+    /// previously-retired fact blocks a fresh knowledge extraction.
     /// Caller frees the returned MemoryEntry.
     pub fn findMemoryByContentHash(
         self: *Self,
@@ -5906,7 +5908,7 @@ const ManagerImpl = struct {
     ) !?memory_root.MemoryEntry {
         const q = try self.buildQuery(
             "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories " ++
-                "WHERE user_id = $1 AND content_hash = $2 AND " ++ MEMORIES_VALIDITY_FILTER ++ " LIMIT 1",
+                "WHERE user_id = $1 AND content_hash = $2 AND " ++ BRAIN_USER_KEY_FILTER ++ " AND " ++ MEMORIES_VALIDITY_FILTER ++ " LIMIT 1",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -22148,13 +22150,14 @@ test "P7 person-as-subject — extracted edge makes the subject a resolvable nod
         try std.testing.expectEqualStrings("0", edge_count);
     }
 
-    // ── Facts 4–5: sentinel predicates may retain their durable fact for
-    //    audit/recall, but must never materialize either endpoint or an edge.
+    // ── Facts 4–5: sentinel predicates may retain internal audit
+    //    bookkeeping, hidden from default recall, but must never materialize
+    //    either endpoint or an edge.
     const rejected_predicate_facts = [_]extraction_persist.ExtractedMemory{
         .{
             .text = "Sentinel Alpha found no connection to Sentinel Beta",
             .subject = "Sentinel Alpha",
-            .predicate = "NO_CONNECTION_FOUND",
+            .predicate = "no_connection_found",
             .object = "Sentinel Beta",
             .attributed_to = "user",
             .confidence = 0.9,
@@ -22162,7 +22165,7 @@ test "P7 person-as-subject — extracted edge makes the subject a resolvable nod
         .{
             .text = "Sentinel Gamma describes Sentinel Delta",
             .subject = "Sentinel Gamma",
-            .predicate = "DESCRIPTION",
+            .predicate = " Description ",
             .object = "Sentinel Delta",
             .attributed_to = "user",
             .confidence = 0.9,
@@ -22191,24 +22194,154 @@ test "P7 person-as-subject — extracted edge makes the subject a resolvable nod
             "SELECT " ++
                 "(SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND content IN " ++
                 "('Sentinel Alpha found no connection to Sentinel Beta', 'Sentinel Gamma describes Sentinel Delta')), " ++
+                "(SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND content IN " ++
+                "('Sentinel Alpha found no connection to Sentinel Beta', 'Sentinel Gamma describes Sentinel Delta') " ++
+                "AND key NOT LIKE 'audit_shell/extraction_sentinel/%'), " ++
                 "(SELECT COUNT(*) FROM {s}.memory_entities WHERE user_id = 2 AND name_lower IN " ++
                 "('sentinel alpha', 'sentinel beta', 'sentinel gamma', 'sentinel delta')), " ++
                 "(SELECT COUNT(*) FROM {s}.memory_edges WHERE user_id = 2 AND fact IN " ++
                 "('Sentinel Alpha found no connection to Sentinel Beta', 'Sentinel Gamma describes Sentinel Delta'))",
-            .{ schema_q, schema_q, schema_q },
+            .{ schema_q, schema_q, schema_q, schema_q },
         );
         defer allocator.free(q);
         const result = try mgr.exec(q);
         defer c.PQclear(result);
         const memory_count = try dupeResultValue(allocator, result, 0, 0);
         defer allocator.free(memory_count);
-        const entity_count = try dupeResultValue(allocator, result, 0, 1);
+        const visible_memory_count = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(visible_memory_count);
+        const entity_count = try dupeResultValue(allocator, result, 0, 2);
         defer allocator.free(entity_count);
-        const edge_count = try dupeResultValue(allocator, result, 0, 2);
+        const edge_count = try dupeResultValue(allocator, result, 0, 3);
         defer allocator.free(edge_count);
         try std.testing.expectEqualStrings("2", memory_count);
+        try std.testing.expectEqualStrings("0", visible_memory_count);
         try std.testing.expectEqualStrings("0", entity_count);
         try std.testing.expectEqualStrings("0", edge_count);
+    }
+
+    // ── Fact 6: conversational meta-narrative predicates are not user/world
+    //    knowledge. They must remain fully rejected rather than surviving as a
+    //    visible, recallable memory merely because graph materialization is
+    //    suppressed.
+    const meta_narrative_fact = [_]extraction_persist.ExtractedMemory{.{
+        .text = "Sentinel Epsilon greeted Sentinel Zeta",
+        .subject = "Sentinel Epsilon",
+        .predicate = " Greeted\t",
+        .object = "Sentinel Zeta",
+        .attributed_to = "user",
+        .confidence = 0.9,
+    }};
+    const r5 = try extraction_persist.persistExtracted(
+        allocator,
+        &mgr,
+        2,
+        "p7-subject-session",
+        &meta_narrative_fact,
+        null,
+        coref,
+        null,
+        .test_wire,
+        0,
+        true,
+    );
+    try std.testing.expectEqual(@as(usize, 0), r5.written_count);
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND content = 'Sentinel Epsilon greeted Sentinel Zeta'",
+            .{schema_q},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const memory_count = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(memory_count);
+        try std.testing.expectEqualStrings("0", memory_count);
+    }
+
+    // ── Facts 7–8: an audit-only sentinel must not poison knowledge dedup.
+    //    The same text can later be correctly classified as a real relation;
+    //    both the hidden audit record and visible entity-backed fact survive.
+    const audit_then_knowledge_text = "Helix is a code editor";
+    const audit_fact = [_]extraction_persist.ExtractedMemory{.{
+        .text = audit_then_knowledge_text,
+        .subject = "Helix",
+        .predicate = "DESCRIPTION",
+        .object = "Code Editor",
+        .attributed_to = "user",
+        .confidence = 0.9,
+    }};
+    const r6 = try extraction_persist.persistExtracted(
+        allocator,
+        &mgr,
+        2,
+        "p7-subject-session",
+        &audit_fact,
+        null,
+        coref,
+        null,
+        .test_wire,
+        0,
+        true,
+    );
+    try std.testing.expectEqual(@as(usize, 1), r6.written_count);
+
+    const knowledge_fact = [_]extraction_persist.ExtractedMemory{.{
+        .text = audit_then_knowledge_text,
+        .subject = "Helix",
+        .predicate = "IS_A",
+        .object = "Code Editor",
+        .attributed_to = "user",
+        .confidence = 0.9,
+    }};
+    const r7 = try extraction_persist.persistExtracted(
+        allocator,
+        &mgr,
+        2,
+        "p7-subject-session",
+        &knowledge_fact,
+        null,
+        coref,
+        null,
+        .test_wire,
+        0,
+        true,
+    );
+    try std.testing.expectEqual(@as(usize, 1), r7.written_count);
+    try std.testing.expectEqual(@as(usize, 0), r7.skipped_md5_dup);
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT " ++
+                "(SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND content = 'Helix is a code editor'), " ++
+                "(SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND content = 'Helix is a code editor' " ++
+                "AND key LIKE 'audit_shell/extraction_sentinel/%'), " ++
+                "(SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND content = 'Helix is a code editor' " ++
+                "AND key NOT LIKE 'audit_shell/extraction_sentinel/%'), " ++
+                "(SELECT COUNT(*) FROM {s}.memory_edges WHERE user_id = 2 AND fact = 'Helix is a code editor' " ++
+                "AND predicate = 'IS_A')",
+            .{ schema_q, schema_q, schema_q, schema_q },
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const total_count = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(total_count);
+        const audit_count = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(audit_count);
+        const visible_count = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(visible_count);
+        const edge_count = try dupeResultValue(allocator, result, 0, 3);
+        defer allocator.free(edge_count);
+        try std.testing.expectEqualStrings("2", total_count);
+        try std.testing.expectEqualStrings("1", audit_count);
+        try std.testing.expectEqualStrings("1", visible_count);
+        try std.testing.expect(try std.fmt.parseInt(usize, edge_count, 10) >= 1);
     }
 }
 
