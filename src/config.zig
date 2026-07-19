@@ -1167,6 +1167,7 @@ pub const Config = struct {
         MissingPostgresConnectionString,
         InvalidPostgresConnectionString,
         UnsafeZakiBotSandboxConfiguration,
+        UnacknowledgedFullAutonomy,
     };
 
     pub fn validate(self: *const Config) ValidationError!void {
@@ -1238,6 +1239,9 @@ pub const Config = struct {
             {
                 return ValidationError.UnsafeZakiBotSandboxConfiguration;
             }
+            if (self.autonomy.level == .full and !self.autonomy.full_acknowledged) {
+                return ValidationError.UnacknowledgedFullAutonomy;
+            }
         }
     }
 
@@ -1300,6 +1304,10 @@ pub const Config = struct {
             ),
             ValidationError.UnsafeZakiBotSandboxConfiguration => std.debug.print(
                 "Config error: zaki_bot profile requires security.sandbox.enabled=true and fail_open_on_dev=false.\n",
+                .{},
+            ),
+            ValidationError.UnacknowledgedFullAutonomy => std.debug.print(
+                "Config error: zaki_bot profile requires autonomy.full_acknowledged=true when autonomy.level=full.\n",
                 .{},
             ),
         }
@@ -4564,7 +4572,7 @@ test "session config parses cross_channel_shared_main" {
     try std.testing.expect(!cfg.session.cross_channel_shared_main);
 }
 
-test "profile zaki_bot enables http request defaults" {
+test "WP-SEC1: zaki_bot does not advertise http request without an allowlist" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -4574,7 +4582,7 @@ test "profile zaki_bot enables http request defaults" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("zaki_bot", cfg.profile);
-    try std.testing.expect(cfg.http_request.enabled);
+    try std.testing.expect(!cfg.http_request.enabled);
     try std.testing.expect(cfg.autonomy.level == .supervised);
     try std.testing.expectEqual(true, cfg.security.sandbox.enabled.?);
     try std.testing.expect(!cfg.security.sandbox.fail_open_on_dev);
@@ -4596,6 +4604,20 @@ test "profile zaki_bot enables http request defaults" {
     try std.testing.expectEqualStrings("on", cfg.memory.reliability.rollout_mode);
     try std.testing.expect(cfg.memory.search.query.hybrid.mmr.enabled);
     try std.testing.expect(cfg.memory.search.query.hybrid.temporal_decay.enabled);
+}
+
+test "WP-SEC1: zaki_bot enables http request when an allowlist is configured" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"profile": "zaki_bot", "http_request": {"allowed_domains": ["api.example.com"]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.http_request.enabled);
+    try std.testing.expectEqual(@as(usize, 1), cfg.http_request.allowed_domains.len);
+    try std.testing.expectEqualStrings("api.example.com", cfg.http_request.allowed_domains[0]);
 }
 
 test "profile defaults do not override explicit http request disable" {
@@ -4686,6 +4708,50 @@ test "WP-SEC1: zaki_bot validation rejects disabled or fail-open sandbox" {
 
     cfg.security.sandbox.fail_open_on_dev = false;
     try cfg.validate();
+}
+
+test "WP-SEC1: zaki_bot full autonomy requires operator acknowledgement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .profile = "zaki_bot",
+        .default_provider = "together-ai",
+        .default_model = "moonshotai/Kimi-K2.6",
+    };
+    cfg.providers = &.{
+        .{ .name = "together-ai", .api_key = "together-valid-key", .base_url = "https://api.together.xyz/v1" },
+    };
+    cfg.state.backend = "postgres";
+    cfg.applySecretRuntimeOverrides(
+        try allocator.dupe(u8, "prod-internal-token-1234"),
+        try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki"),
+    );
+    cfg.security.sandbox.enabled = true;
+    cfg.autonomy.level = .full;
+
+    try std.testing.expectError(Config.ValidationError.UnacknowledgedFullAutonomy, cfg.validate());
+
+    cfg.autonomy.full_acknowledged = true;
+    try cfg.validate();
+}
+
+test "WP-SEC1: parser reads full autonomy acknowledgement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(
+        \\{"autonomy":{"level":"full","full_acknowledged":true}}
+    );
+
+    try std.testing.expectEqual(AutonomyLevel.full, cfg.autonomy.level);
+    try std.testing.expect(cfg.autonomy.full_acknowledged);
 }
 
 test "zaki_bot validation rejects missing provider config" {
@@ -4993,7 +5059,7 @@ test "save and parse preserve profile" {
     try loaded.parseJson(content);
 
     try std.testing.expectEqualStrings("zaki_bot", loaded.profile);
-    try std.testing.expect(loaded.http_request.enabled);
+    try std.testing.expect(!loaded.http_request.enabled);
 }
 
 test "image_model config: parsed and defaults to empty" {

@@ -30,7 +30,7 @@ pub const ApprovalPolicy = enum {
     /// - read_only autonomy: always deny
     /// - supervised: auto-approve read_only tools and explicitly whitelisted
     ///   local artifact writes, deny operator_only, confirm_once for all other
-    ///   mutating tools, auto-approve otherwise
+    ///   tools
     pub fn forTool(meta: metadata.ToolMetadata, autonomy: policy.AutonomyLevel) ApprovalPolicy {
         return switch (autonomy) {
             .full => .auto_approve,
@@ -40,7 +40,7 @@ pub const ApprovalPolicy = enum {
                 if (meta.flags.read_only) return .auto_approve;
                 if (meta.flags.supervised_auto_approve) return .auto_approve;
                 if (meta.flags.mutating) return .confirm_once;
-                return .auto_approve;
+                return .confirm_once;
             },
         };
     }
@@ -114,6 +114,11 @@ test "supervised auto-approves read_only tools" {
 
 test "supervised confirms mutating tools" {
     const meta = metadata.ToolMetadata{ .name = "shell", .flags = .{ .mutating = true } };
+    try std.testing.expectEqual(ApprovalPolicy.confirm_once, ApprovalPolicy.forTool(meta, .supervised));
+}
+
+test "WP-SEC1: supervised confirms tools without a capability classification" {
+    const meta = metadata.ToolMetadata{ .name = "unclassified" };
     try std.testing.expectEqual(ApprovalPolicy.confirm_once, ApprovalPolicy.forTool(meta, .supervised));
 }
 
