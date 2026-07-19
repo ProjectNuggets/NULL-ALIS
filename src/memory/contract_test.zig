@@ -118,6 +118,22 @@ test "memory contract: scaffold entity names are denied, near-misses are not" {
     try std.testing.expect(!context_builder.isScaffoldEntityName("Acme Corp"));
 }
 
+test "memory contract: extraction persistence rejects non-relational sentinel predicates" {
+    // extraction_persist imports memory/root, so importing it back from this
+    // root-hosted contract test would create a module cycle. Pin the exact
+    // write-boundary constant block instead: moving or removing either entry
+    // now requires an intentional contract update.
+    const source = @embedFile("../agent/extraction_persist.zig");
+    const block_start = std.mem.indexOf(u8, source, "const REJECTED_PREDICATES") orelse
+        return error.ContractSourceMissing;
+    const block_tail = source[block_start..];
+    const block_end = std.mem.indexOf(u8, block_tail, "};") orelse
+        return error.ContractSourceMissing;
+    const rejected_predicates = block_tail[0 .. block_end + 2];
+    try std.testing.expect(std.mem.indexOf(u8, rejected_predicates, "\"NO_CONNECTION_FOUND\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_predicates, "\"DESCRIPTION\"") != null);
+}
+
 test "memory contract: extraction tool denylist is exactly the contracted set" {
     const contracted = [_][]const u8{
         "memory_doctor",    "memory_maintain", "brain_graph",
