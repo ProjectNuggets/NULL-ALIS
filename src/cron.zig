@@ -430,6 +430,28 @@ fn nextRunForCronExpression(expression: []const u8, from_secs: i64) !i64 {
     return error.NoFutureRunFound;
 }
 
+/// Whether a completed Agent turn may cross the scheduler's durable-output
+/// boundary. The scheduler deliberately owns this small contract rather than
+/// importing Agent/session internals.
+pub const AgentOutputRetention = enum {
+    retain,
+    display_only,
+};
+
+/// Owned result returned by an Agent scheduler runner. `deinit` is for
+/// transient results; `.retain` results transferred into `CronJob.last_output`
+/// remain owned by the scheduler job instead.
+pub const AgentRunResult = struct {
+    output: []const u8,
+    retention: AgentOutputRetention = .retain,
+
+    pub fn deinit(self: *AgentRunResult, allocator: std.mem.Allocator) void {
+        if (self.output.len > 0) std.crypto.secureZero(u8, @constCast(self.output));
+        allocator.free(self.output);
+        self.* = undefined;
+    }
+};
+
 /// In-memory cron job store (no SQLite dependency for the minimal Zig port).
 pub const CronScheduler = struct {
     pub const AgentRunnerFn = *const fn (
@@ -438,7 +460,7 @@ pub const CronScheduler = struct {
         scheduler: *const CronScheduler,
         job: *const CronJob,
         prompt: []const u8,
-    ) anyerror![]const u8;
+    ) anyerror!AgentRunResult;
 
     jobs: std.ArrayListUnmanaged(CronJob),
     runs: std.ArrayListUnmanaged(CronRun) = .empty,
@@ -938,7 +960,7 @@ pub const CronScheduler = struct {
                 .agent => {
                     const agent_input = job.prompt orelse job.command;
                     var success = true;
-                    const agent_output = blk: {
+                    const agent_result: ?AgentRunResult = blk: {
                         if (self.agent_runner) |runner| {
                             break :blk runner(
                                 self.agent_runner_ctx,
@@ -948,15 +970,17 @@ pub const CronScheduler = struct {
                                 agent_input,
                             ) catch |err| {
                                 success = false;
-                                break :blk std.fmt.allocPrint(
+                                const error_output = std.fmt.allocPrint(
                                     self.allocator,
                                     "agent cron failed: {s}",
                                     .{@errorName(err)},
-                                ) catch null;
+                                ) catch break :blk null;
+                                break :blk .{ .output = error_output };
                             };
                         }
                         success = false;
-                        break :blk self.allocator.dupe(u8, "agent runner unavailable") catch null;
+                        const unavailable_output = self.allocator.dupe(u8, "agent runner unavailable") catch break :blk null;
+                        break :blk .{ .output = unavailable_output };
                     };
                     job.last_run_secs = now;
                     job.last_status = if (success) "ok" else "error";
@@ -969,8 +993,10 @@ pub const CronScheduler = struct {
                     if (job.last_output_owned) {
                         if (job.last_output) |old| self.allocator.free(old);
                     }
-                    job.last_output = agent_output;
-                    job.last_output_owned = job.last_output != null;
+                    job.last_output = null;
+                    job.last_output_owned = false;
+
+                    const output = if (agent_result) |result| result.output else "";
 
                     if (out_bus) |b| {
                         _ = deliverResultForContext(
@@ -982,10 +1008,23 @@ pub const CronScheduler = struct {
                             self.context_expect_postgres_state,
                             job.id,
                             job.delivery,
-                            job.last_output orelse "",
+                            output,
                             success,
                             b,
                         ) catch {};
+                    }
+
+                    if (agent_result) |result| {
+                        switch (result.retention) {
+                            .retain => {
+                                job.last_output = result.output;
+                                job.last_output_owned = true;
+                            },
+                            .display_only => {
+                                var transient_result = result;
+                                transient_result.deinit(self.allocator);
+                            },
+                        }
                     }
                 },
             }
@@ -2488,8 +2527,8 @@ fn testAgentRunner(
     _: *const CronScheduler,
     _: *const CronJob,
     prompt: []const u8,
-) ![]u8 {
-    return std.fmt.allocPrint(allocator, "ran:{s}", .{prompt});
+) !AgentRunResult {
+    return .{ .output = try std.fmt.allocPrint(allocator, "ran:{s}", .{prompt}) };
 }
 
 fn failingAgentRunner(
@@ -2498,8 +2537,31 @@ fn failingAgentRunner(
     _: *const CronScheduler,
     _: *const CronJob,
     _: []const u8,
-) ![]u8 {
+) !AgentRunResult {
     return error.TestFailure;
+}
+
+const DisplayOnlyRunnerContext = struct {
+    storage_base: [*]u8,
+    output_offset: ?usize = null,
+    output_len: usize = 0,
+};
+
+fn displayOnlyAgentRunner(
+    ctx: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    _: *const CronScheduler,
+    _: *const CronJob,
+    _: []const u8,
+) !AgentRunResult {
+    const runner_ctx: *DisplayOnlyRunnerContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const output = try allocator.dupe(u8, "meeting-derived-display-only");
+    runner_ctx.output_offset = @intFromPtr(output.ptr) - @intFromPtr(runner_ctx.storage_base);
+    runner_ctx.output_len = output.len;
+    return .{
+        .output = output,
+        .retention = .display_only,
+    };
 }
 
 test "JobType parse and asStr" {
@@ -2939,6 +3001,56 @@ test "agent job uses configured runner when available" {
     try std.testing.expectEqualStrings("ok", scheduler.jobs.items[0].last_status.?);
     try std.testing.expect(scheduler.jobs.items[0].last_output != null);
     try std.testing.expectEqualStrings("ran:hello-runner", scheduler.jobs.items[0].last_output.?);
+}
+
+test "display-only agent output is delivered without entering scheduler persistence" {
+    var storage: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = fixed.allocator();
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    var runner_ctx = DisplayOnlyRunnerContext{ .storage_base = storage[0..].ptr };
+    scheduler.setAgentRunner(displayOnlyAgentRunner, &runner_ctx);
+
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    try scheduler.jobs.append(allocator, .{
+        .id = try allocator.dupe(u8, "agent-display-only-1"),
+        .expression = try allocator.dupe(u8, "* * * * *"),
+        .command = try allocator.dupe(u8, "fallback"),
+        .job_type = .agent,
+        .prompt = try allocator.dupe(u8, "summarize meeting"),
+        .prompt_owned = true,
+        .next_run_secs = 0,
+        .delivery = .{
+            .mode = .always,
+            .channel = "zaki_app",
+            .to = "user-1",
+        },
+        .last_output = try allocator.dupe(u8, "previous ordinary output"),
+        .last_output_owned = true,
+    });
+
+    _ = scheduler.tick(std.time.timestamp(), &test_bus);
+
+    try std.testing.expectEqualStrings("ok", scheduler.jobs.items[0].last_status.?);
+    try std.testing.expect(scheduler.jobs.items[0].last_output == null);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listRuns("agent-display-only-1", 10).len);
+    const output_offset = runner_ctx.output_offset orelse return error.TestUnexpectedResult;
+    const cleared_output = storage[output_offset .. output_offset + runner_ctx.output_len];
+    try std.testing.expect(std.mem.indexOf(u8, cleared_output, "meeting-derived-display-only") == null);
+
+    const jobs_json = try saveJobsToSlice(allocator, &scheduler);
+    defer allocator.free(jobs_json);
+    try std.testing.expect(std.mem.indexOf(u8, jobs_json, "meeting-derived-display-only") == null);
+    try std.testing.expect(std.mem.indexOf(u8, jobs_json, "previous ordinary output") == null);
+    try std.testing.expect(std.mem.indexOf(u8, jobs_json, "\"last_output\":null") != null);
+
+    try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("meeting-derived-display-only", msg.content);
 }
 
 test "tick applies cooldown after repeated failures" {

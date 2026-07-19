@@ -19069,8 +19069,8 @@ test "postgres claimed recurring job reschedules and records run" {
     // returns a fixed string — the test's intent is "scheduler reschedules
     // and records run", not "agent execution semantics."
     const StubRunner = struct {
-        fn run(_: ?*anyopaque, alloc: std.mem.Allocator, _: *const cron_mod.CronScheduler, _: *const cron_mod.CronJob, _: []const u8) ![]const u8 {
-            return alloc.dupe(u8, "ok");
+        fn run(_: ?*anyopaque, alloc: std.mem.Allocator, _: *const cron_mod.CronScheduler, _: *const cron_mod.CronJob, _: []const u8) !cron_mod.AgentRunResult {
+            return .{ .output = try alloc.dupe(u8, "ok") };
         }
     };
     runtime_scheduler.setAgentRunner(&StubRunner.run, null);
