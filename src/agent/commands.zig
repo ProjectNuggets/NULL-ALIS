@@ -395,39 +395,11 @@ fn wishMatchHasOverlap(allocator: std.mem.Allocator, query: []const u8, name: []
     return false;
 }
 
-/// V1.6 cmt9.5 — derive a hash-stable entity key from an `object` string,
-/// mirroring extraction_persist.deriveEntityKey shape so session-end edges
-/// land on the SAME entity nodes that compaction Pass C extraction creates.
-/// `entity_<sha256(lower(object))[0..16]>`. Lowercase normalizes capitalization
-/// variance ("Helix" vs "helix"). V1.7a-4 (closes ship-review WR-02): the
-/// canonicalization helper is now `extraction_persist.lowerForEntityKey`
-/// (Unicode-aware over ASCII + Latin-1 Supplement) — single source of truth
-/// for both Zig sites and matched server-side by PG `lower(...)` in the
-/// cmt16 backfill SQL. Cmt8 entity coreference (cosine ≥0.95) is not
-/// plumbed here — commands.zig has no embedding provider in scope; full
-/// coref requires routing through extraction_persist (cmt9.6 follow-up).
-fn deriveSessionEndEntityKey(allocator: std.mem.Allocator, object: []const u8) ![]u8 {
-    const lower = try extraction_persist.lowerForEntityKey(allocator, object);
-    defer allocator.free(lower);
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(lower);
-    var digest: [32]u8 = undefined;
-    hasher.final(&digest);
-    var hex_buf: [16]u8 = undefined;
-    const hex_chars = "0123456789abcdef";
-    for (digest[0..8], 0..) |b, i| {
-        hex_buf[i * 2] = hex_chars[b >> 4];
-        hex_buf[i * 2 + 1] = hex_chars[b & 0x0f];
-    }
-    return std.fmt.allocPrint(allocator, "entity_{s}", .{hex_buf});
-}
-
 /// P2 (memory-phase-0.5) — derive a stable, content-addressed key for a
 /// session-end durable fact.
 ///
 /// ALL facts (triple or prose) produce `durable_fact/<sha256_hex(content)[0..32]>`.
-/// Using the first 16 bytes (128-bit) of SHA-256 as a 32 hex-char suffix,
-/// matching the `deriveSessionEndEntityKey` pattern above.
+/// Using the first 16 bytes (128-bit) of SHA-256 as a 32 hex-char suffix.
 ///
 /// This preserves byte-for-byte identical classification vs the original
 /// timestamp-keyed scheme: `durable_fact/` is listed in
@@ -1743,7 +1715,6 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
     updateTimelineIndex(self.allocator, mem, rt, session_id, now_iso, focus, timeline_key, summary_origin);
 
     if (parsed_summary) |parsed| {
-        var triple_edges_written: usize = 0;
         for (parsed.extracted_facts, 0..) |fact, idx| {
             _ = idx; // P2: index no longer used in key — content-addressed below
             const fact_key = deriveDurableFactKey(self.allocator, &fact) catch continue;
@@ -1770,81 +1741,12 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             } else |_| {
                 continue;
             }
-
-            // V1.6 cmt9.5 (Gap 3): when the LLM emitted a structured triple
-            // alongside the prose Key fact (===EXTRACTED=== JSON tail), also
-            // write an edge to memory_edges so the session-end fact joins
-            // the materialized graph. Source is the durable_fact row we
-            // just wrote (continuity-bucket; agent context preserved);
-            // target is a hash-derived entity key (V1.6 cmt7 shape — cmt8
-            // entity coreference is intentionally NOT plumbed here, since
-            // commands.zig doesn't have an embedding provider in scope and
-            // adding one through the agent surface is a separate refactor).
-            //
-            // V1.7 cmt9.6 (full Gap 3 closure): when fact carries a triple
-            // AND tenant has extraction context, ALSO route through
-            // extraction_persist.persistExtracted — this gets us coref +
-            // edge insert + source attribution, AND the resulting
-            // extracted_<hash> row is now first-class continuity (added
-            // to memory_loader.isSemanticContinuityKey in cmt9.6). The
-            // inline durable_fact write above is preserved as a legacy
-            // dual-write for backwards compat with /learn list/forget
-            // commands; future commit may collapse to single-write once
-            // those tools migrate to extracted_* keys.
-            //
-            // V1.14.12 (Memory audit Finding 1 fix, 2026-05-19) — the
-            // durable_fact/* prefix is now brain-VISIBLE (was previously
-            // hidden via BRAIN_HIDDEN_PREFIXES, which combined with the
-            // MD5 dedup below to make session-end facts invisible
-            // everywhere). The dedup below is now intentional, not a
-            // bug: durable_fact is THE visible user-facing row; the
-            // extracted_<hash> path is the (no-op'd) coref+judge enrich
-            // path. The edge write further below ALWAYS fires regardless
-            // of MD5 dedup — covers the graph half of unification.
-            //
-            // MD5 dedup in persistExtracted will see the durable_fact row's
-            // identical content_hash and silently skip the extracted_<hash>
-            // write. This is the intended behavior post-Finding-1: one
-            // visible row per session-end fact, not two.
-            if (fact.hasTriple()) {
-                if (self.extraction_state_mgr) |smgr| {
-                    if (self.extraction_user_id) |uid| {
-                        const target_key = deriveSessionEndEntityKey(self.allocator, fact.object.?) catch null;
-                        if (target_key) |tk| {
-                            defer self.allocator.free(tk);
-                            smgr.upsertMemoryEdge(
-                                uid,
-                                fact_key,
-                                tk,
-                                fact.predicate.?,
-                                "session_end_loop",
-                                fact.confidence,
-                            ) catch |err| {
-                                log.warn("session_end edge write failed key={s} predicate={s} err={s}", .{
-                                    fact_key, fact.predicate.?, @errorName(err),
-                                });
-                                continue;
-                            };
-                            triple_edges_written += 1;
-                        }
-
-                        // V1.14.12 (Path A) — legacy direct write deleted.
-                        // Session-end durable_fact promotion flows entirely
-                        // through extractAtBoundary at the block below
-                        // (write_origin = .session_end_extract). The
-                        // extractAtBoundary path now handles null-judge
-                        // gracefully so this deletion doesn't regress
-                        // no-judge tenants.
-                    }
-                }
-            }
         }
-        log.info("memory.timeline_summary status=ok session={s} reason={s} entries={d} facts={d} edges={d} next={s}", .{
+        log.info("memory.timeline_summary status=ok session={s} reason={s} entries={d} facts={d} next={s}", .{
             session_id,
             reason,
             entries.len,
             parsed.extracted_facts.len,
-            triple_edges_written,
             next,
         });
 
@@ -7500,4 +7402,31 @@ test "/learn adopt on a legacy fact (no metadata header at all) reports 'already
     const entry = (try mem.get(allocator, "durable_fact/behavior/legacynoheader01")) orelse return error.EntryNotFound;
     defer entry.deinit(allocator);
     try std.testing.expectEqualStrings("onboarding reminders should be gentle", entry.content);
+}
+
+test "WP-MEM8: session end delegates graph edges to the entity pipeline" {
+    // Architecture regression guard scoped to the session-end summarizer:
+    // it persists durable facts and delegates graph writes to the configured
+    // classifier pipeline. Unrelated graph writers elsewhere in this large
+    // module must not make this contract fail.
+    const source = @embedFile("commands.zig");
+    const function_start = std.mem.indexOf(u8, source, "fn persistSessionSemanticSummary(") orelse
+        return error.TestExpectedEqual;
+    const function_end_relative = std.mem.indexOf(
+        u8,
+        source[function_start..],
+        "\npub fn persistSessionCheckpoint(",
+    ) orelse return error.TestExpectedEqual;
+    const function_source = source[function_start .. function_start + function_end_relative];
+    const legacy_origin = "session_end_" ++ "loop";
+    const legacy_key_helper = "deriveSessionEnd" ++ "EntityKey";
+
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "deriveDurableFactKey") != null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "mem.store(fact_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "session_end_entity_pipeline_enabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "enqueueExtractionJob(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "\"session_end\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, ".upsertMemoryEdge(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, legacy_origin) == null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, legacy_key_helper) == null);
 }

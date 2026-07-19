@@ -2741,9 +2741,8 @@ const ManagerImpl = struct {
             // Cost: O(N) over rows with metadata.subject populated. On
             // Nova's user_id=1 dev DB this is a small number; production
             // scale will run during a maintenance window.
-            // V1.7a-4 (closes V1.6 ship-review WR-02): both Zig sites
-            // (extraction_persist.deriveEntityKey + commands.deriveSessionEndEntityKey)
-            // now route through extraction_persist.lowerForEntityKey, a
+            // V1.7a-4 (closes V1.6 ship-review WR-02): runtime extraction
+            // routes through extraction_persist.lowerForEntityKey, a
             // Unicode-aware helper covering ASCII A-Z + Latin-1 Supplement
             // + Cyrillic + Greek uppercase → lowercase. PG's `lower(...)`
             // matches this in standard UTF-8 locales (en_US.UTF-8 etc. —
