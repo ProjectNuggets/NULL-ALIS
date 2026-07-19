@@ -203,6 +203,21 @@ pub const ToolMetadata = struct {
     pub fn validate(self: ToolMetadata) error{ ContradictoryFlags, InvalidAutoApproveMetadata }!void {
         try self.flags.validate();
         if (self.flags.supervised_auto_approve) {
+            const allowed_names = [_][]const u8{
+                "memory_store",    "memory_edit",      "compose_memory", "wiki_link",
+                "memory_archive",  "memory_demote",    "todo",           "file_write",
+                "file_edit",       "file_edit_hashed", "file_append",    "produce_document",
+                "artifact_create", "artifact_update",
+            };
+
+            var name_allowed = false;
+            for (allowed_names) |allowed_name| {
+                if (std.mem.eql(u8, self.name, allowed_name)) {
+                    name_allowed = true;
+                    break;
+                }
+            }
+            if (!name_allowed) return error.InvalidAutoApproveMetadata;
             if (!self.flags.mutating or self.flags.read_only or self.flags.operator_only) {
                 return error.InvalidAutoApproveMetadata;
             }
@@ -376,6 +391,28 @@ test "ToolMetadata validates supervised auto-approve as bounded mutating only" {
         .cost_class = .a,
     };
     try std.testing.expectError(error.ContradictoryFlags, read_only.validate());
+}
+
+test "WP-SEC1: ToolMetadata rejects supervised auto-approve outside the exact allowlist" {
+    const forbidden_names = [_][]const u8{
+        "message",
+        "artifact_share",
+        "schedule",
+        "cron_add",
+        "cron_update",
+        "cron_remove",
+        "cron_run",
+    };
+
+    for (forbidden_names) |name| {
+        const candidate = ToolMetadata{
+            .name = name,
+            .flags = .{ .mutating = true, .supervised_auto_approve = true },
+            .risk_level = .low,
+            .cost_class = .a,
+        };
+        try std.testing.expectError(error.InvalidAutoApproveMetadata, candidate.validate());
+    }
 }
 
 test "metadataFor uses declared metadata" {
