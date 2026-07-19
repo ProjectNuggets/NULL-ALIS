@@ -82,7 +82,7 @@ fn runtimeHasTool(runtime_tools: ?[]const Tool, name: []const u8) bool {
 }
 
 fn optionalToolEnabledByConfig(cfg: *const Config, name: []const u8) bool {
-    if (std.mem.eql(u8, name, "http_request")) return cfg.http_request.enabled;
+    if (std.mem.eql(u8, name, "http_request")) return cfg.http_request.enabled and cfg.http_request.allowed_domains.len > 0;
     if (std.mem.eql(u8, name, "web_fetch")) return cfg.http_request.enabled;
     if (std.mem.eql(u8, name, "web_search")) return cfg.http_request.enabled;
     // agent_browser backend — the five browser_* tools are the only
@@ -531,6 +531,58 @@ test "buildManifestJson estimated tools align with runtime naming" {
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"pushover\"") != null);
 }
 
+test "WP-SEC1: zaki_bot keeps open web tools without an HTTP allowlist" {
+    const Test = struct {
+        fn containsString(value: std.json.Value, expected: []const u8) bool {
+            if (value != .array) return false;
+            for (value.array.items) |item| {
+                if (item == .string and std.mem.eql(u8, item.string, expected)) return true;
+            }
+            return false;
+        }
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(
+        \\{"profile":"zaki_bot"}
+    );
+
+    const runtime_tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
+        .config = &cfg,
+        .http_enabled = cfg.http_request.enabled,
+        .tools_config = cfg.tools,
+    });
+    defer tools_mod.deinitTools(allocator, runtime_tools);
+
+    try std.testing.expect(!runtimeHasTool(runtime_tools, "http_request"));
+    try std.testing.expect(runtimeHasTool(runtime_tools, "web_fetch"));
+    try std.testing.expect(runtimeHasTool(runtime_tools, "web_search"));
+
+    const manifest = try buildManifestJson(allocator, &cfg, runtime_tools);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, manifest, .{});
+    defer parsed.deinit();
+    const tools = parsed.value.object.get("tools").?.object;
+    const loaded = tools.get("runtime_loaded").?;
+    const enabled = tools.get("optional_enabled_by_config").?;
+    const disabled = tools.get("optional_disabled_by_config").?;
+
+    try std.testing.expect(!Test.containsString(loaded, "http_request"));
+    try std.testing.expect(Test.containsString(loaded, "web_fetch"));
+    try std.testing.expect(Test.containsString(loaded, "web_search"));
+    try std.testing.expect(!Test.containsString(enabled, "http_request"));
+    try std.testing.expect(Test.containsString(enabled, "web_fetch"));
+    try std.testing.expect(Test.containsString(enabled, "web_search"));
+    try std.testing.expect(Test.containsString(disabled, "http_request"));
+}
+
 test "optional tools reflect http toggle for web tools" {
     var cfg = Config{
         .workspace_dir = "/tmp/yc_test",
@@ -555,7 +607,16 @@ test "optional tools reflect http toggle for web tools" {
         if (std.mem.eql(u8, name, "web_search")) saw_web_search = true;
     }
 
-    try std.testing.expect(saw_http_request);
+    try std.testing.expect(!saw_http_request);
     try std.testing.expect(saw_web_fetch);
     try std.testing.expect(saw_web_search);
+
+    cfg.http_request.allowed_domains = &.{"api.example.com"};
+    const optional_enabled_allowlisted = try collectOptionalTools(std.testing.allocator, &cfg, .enabled);
+    defer std.testing.allocator.free(optional_enabled_allowlisted);
+    var saw_allowlisted_http_request = false;
+    for (optional_enabled_allowlisted) |name| {
+        if (std.mem.eql(u8, name, "http_request")) saw_allowlisted_http_request = true;
+    }
+    try std.testing.expect(saw_allowlisted_http_request);
 }

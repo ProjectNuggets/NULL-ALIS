@@ -1731,11 +1731,12 @@ pub fn allTools(
     }
 
     if (opts.http_enabled) {
-        const ht = try allocator.create(http_request.HttpRequestTool);
-        ht.* = .{
-            .allowed_domains = if (opts.config) |cfg| cfg.http_request.allowed_domains else &.{},
-        };
-        try list.append(allocator, ht.tool());
+        const http_allowed_domains = if (opts.config) |cfg| cfg.http_request.allowed_domains else &.{};
+        if (http_allowed_domains.len > 0) {
+            const ht = try allocator.create(http_request.HttpRequestTool);
+            ht.* = .{ .allowed_domains = http_allowed_domains };
+            try list.append(allocator, ht.tool());
+        }
 
         const wft = try allocator.create(web_fetch.WebFetchTool);
         wft.* = .{ .default_max_chars = tc.web_fetch_max_chars };
@@ -3448,6 +3449,7 @@ test "all tools includes extras when enabled" {
         .workspace_dir = "/tmp/yc_test",
         .config_path = "/tmp/yc_test/config.json",
         .allocator = std.testing.allocator,
+        .http_request = .{ .allowed_domains = &.{"api.example.com"} },
     };
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
         .config = &cfg,

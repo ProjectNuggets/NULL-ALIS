@@ -2357,13 +2357,6 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
-    if (types.AppProfile.fromString(self.profile) == .zaki_bot and self.http_request.allowed_domains.len == 0) {
-        // `http_request` fails closed without destinations. Do not advertise
-        // an always-erroring tool in the production profile, even if enabled
-        // was explicitly set without the required allowlist.
-        self.http_request.enabled = false;
-    }
-
     // Default named agent: inject `scientific_researcher` when the operator
     // hasn't defined any agents.list[] entries AND a primary model is set.
     // Operator-defined list wins entirely (no merging) — set agents.list = []
