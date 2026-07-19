@@ -18887,17 +18887,14 @@ fn loadMeetingMemoryCrypto(
     allocator: std.mem.Allocator,
     cfg: config_types.MeetingMemoryCryptoConfig,
 ) !?MeetingMemoryCrypto {
+    if (!cfg.enabled) return null;
+
     var pseudonym_seed = try loadMeetingMemorySeed(allocator, cfg.pseudonym_key_env);
     defer if (pseudonym_seed) |*seed| std.crypto.secureZero(u8, seed);
     var receipt_seed = try loadMeetingMemorySeed(allocator, cfg.receipt_signing_seed_env);
     defer if (receipt_seed) |*seed| std.crypto.secureZero(u8, seed);
 
-    if (pseudonym_seed == null and receipt_seed == null) {
-        if (cfg.receipt_secondary_public_key_env != null) {
-            return error.IncompleteMeetingMemoryCryptoConfig;
-        }
-        return null;
-    }
+    if (pseudonym_seed == null and receipt_seed == null) return error.IncompleteMeetingMemoryCryptoConfig;
     if (pseudonym_seed == null or receipt_seed == null) {
         return error.IncompleteMeetingMemoryCryptoConfig;
     }
@@ -18910,6 +18907,30 @@ fn loadMeetingMemoryCrypto(
         receipt_seed.?,
         secondary,
     );
+}
+
+test "meeting memory crypto configuration defaults to explicit disabled" {
+    try std.testing.expect(!(config_types.MeetingMemoryCryptoConfig{}).enabled);
+}
+
+test "meeting memory crypto requires both seeds when explicitly enabled" {
+    const cfg = config_types.MeetingMemoryCryptoConfig{
+        .enabled = true,
+        .pseudonym_key_env = "NULLALIS_WP15_TEST_ABSENT_PSEUDONYM_KEY",
+        .receipt_signing_seed_env = "NULLALIS_WP15_TEST_ABSENT_RECEIPT_SEED",
+    };
+    try std.testing.expectError(
+        error.IncompleteMeetingMemoryCryptoConfig,
+        loadMeetingMemoryCrypto(std.testing.allocator, cfg),
+    );
+}
+
+test "meeting memory crypto does not inspect incomplete configuration while disabled" {
+    const cfg = config_types.MeetingMemoryCryptoConfig{
+        .enabled = false,
+        .receipt_secondary_public_key_env = "NULLALIS_WP15_DISABLED_TEST_DO_NOT_READ",
+    };
+    try std.testing.expect((try loadMeetingMemoryCrypto(std.testing.allocator, cfg)) == null);
 }
 
 test "canIgnoreMigrateError tolerates extension duplicate key race" {

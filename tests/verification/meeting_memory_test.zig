@@ -23,6 +23,13 @@ const test_pseudonymizer = blk: {
     break :blk meeting_memory.Pseudonymizer.init(test_pseudonym_key);
 };
 
+test "WP-15 migrations remain unregistered while Minutes activation is off" {
+    for (nullalis.migrations.MIGRATIONS) |migration| {
+        try std.testing.expect(!std.mem.eql(u8, migration.name, "0011_meeting_memory_provenance"));
+        try std.testing.expect(!std.mem.eql(u8, migration.name, "0012_meeting_memory_erasure_indexes"));
+    }
+}
+
 fn installMeetingMemoryCrypto(mgr: anytype) !void {
     try mgr.installMeetingMemoryCryptoForTests(
         test_pseudonym_key,

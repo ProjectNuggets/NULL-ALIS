@@ -1993,6 +1993,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (st.object.get("meeting_memory_crypto")) |crypto| {
                 if (crypto == .object) {
+                    if (crypto.object.get("enabled")) |v| {
+                        if (v == .bool) self.state.meeting_memory_crypto.enabled = v.bool;
+                    }
                     if (crypto.object.get("pseudonym_key_env")) |v| {
                         if (v == .string) self.state.meeting_memory_crypto.pseudonym_key_env = try self.allocator.dupe(u8, v.string);
                     }

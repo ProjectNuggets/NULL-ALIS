@@ -1529,9 +1529,12 @@ pub const StatePostgresConfig = struct {
 /// Operator-only env indirection for Minutes memory cryptography. These are
 /// env-var names, never secret material and never user/tenant preferences.
 pub const MeetingMemoryCryptoConfig = struct {
+    /// An explicit operator gate. Secret projection alone must not activate
+    /// this dormant provenance/erasure boundary. When enabled, both primary
+    /// key variables are required so a malformed activation fails at boot.
+    enabled: bool = false,
     /// Environment variable containing at least 32 bytes of pseudonym-key
-    /// material. Both secret variables absent keeps Minutes memory off; only
-    /// one present is a fail-closed boot error.
+    /// material.
     pseudonym_key_env: []const u8 = "NULLALIS_MINUTES_MEMORY_PSEUDONYM_KEY",
     /// Environment variable containing at least 32 bytes of seed material for
     /// the current Ed25519 receipt signer.
