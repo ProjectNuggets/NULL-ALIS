@@ -4572,7 +4572,7 @@ test "session config parses cross_channel_shared_main" {
     try std.testing.expect(!cfg.session.cross_channel_shared_main);
 }
 
-test "WP-SEC1: zaki_bot does not advertise http request without an allowlist" {
+test "WP-SEC1: zaki_bot keeps the shared web gate enabled without an HTTP allowlist" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -4582,7 +4582,7 @@ test "WP-SEC1: zaki_bot does not advertise http request without an allowlist" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("zaki_bot", cfg.profile);
-    try std.testing.expect(!cfg.http_request.enabled);
+    try std.testing.expect(cfg.http_request.enabled);
     try std.testing.expect(cfg.autonomy.level == .supervised);
     try std.testing.expectEqual(true, cfg.security.sandbox.enabled.?);
     try std.testing.expect(!cfg.security.sandbox.fail_open_on_dev);
@@ -5059,7 +5059,7 @@ test "save and parse preserve profile" {
     try loaded.parseJson(content);
 
     try std.testing.expectEqualStrings("zaki_bot", loaded.profile);
-    try std.testing.expect(!loaded.http_request.enabled);
+    try std.testing.expect(loaded.http_request.enabled);
 }
 
 test "image_model config: parsed and defaults to empty" {
