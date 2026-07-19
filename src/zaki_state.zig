@@ -5339,7 +5339,7 @@ const ManagerImpl = struct {
             // a nested prose string or object property name, so walk every JSONB
             // node. Limit substring matching to canonical keys: they are
             // fixed-width opaque identifiers, unlike legacy malformed keys
-            // that could otherwise over-match ordinary prose.
+            // that could otherwise over-match ordinary prose or property names.
             {
                 const q = try self.buildQuery(
                     "WITH targets AS MATERIALIZED (" ++
@@ -5356,8 +5356,11 @@ const ManagerImpl = struct {
                         "carrier.value = to_jsonb(t.key) OR carrier.value = to_jsonb(t.id) " ++
                         "OR (t.key ~ '^meeting_ingest/[0-9a-f]{64}$' " ++
                         "AND strpos(carrier.value #>> '{}', t.key) > 0))) " ++
-                        "OR (jsonb_typeof(carrier.value) = 'object' " ++
-                        "AND (carrier.value ? t.key OR carrier.value ? t.id))))",
+                        "OR (jsonb_typeof(carrier.value) = 'object' AND (" ++
+                        "carrier.value ? t.key OR carrier.value ? t.id " ++
+                        "OR (t.key ~ '^meeting_ingest/[0-9a-f]{64}$' AND EXISTS (" ++
+                        "SELECT 1 FROM jsonb_object_keys(carrier.value) AS property(name) " ++
+                        "WHERE strpos(property.name, t.key) > 0))))))",
                 );
                 defer self.allocator.free(q);
                 const result = try txn.execParams(q, &scope_params, &scope_lengths);

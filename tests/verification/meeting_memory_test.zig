@@ -1177,6 +1177,7 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
             "('wp15-meeting-nested-value-event', {d}, NULL, 'legacy', jsonb_build_object('nested', jsonb_build_array(jsonb_build_object('value', '{s}')))), " ++
             "('wp15-meeting-nested-property-event', {d}, NULL, 'legacy', jsonb_build_object('nested', jsonb_build_object('{s}', true))), " ++
             "('wp15-meeting-embedded-string-event', {d}, NULL, 'legacy', jsonb_build_object('note', 'legacy prose carries {s} inline')), " ++
+            "('wp15-meeting-embedded-property-event', {d}, NULL, 'legacy', jsonb_build_object('nested', jsonb_build_object('legacy-prefix-{s}-suffix', true))), " ++
             "('wp15-unrelated-nested-event', {d}, NULL, 'legacy', jsonb_build_object('nested', jsonb_build_array(jsonb_build_object('value', '{s}')))), " ++
             "('wp15-unrelated-traversal-event', {d}, NULL, 'traversal', jsonb_build_object('node_keys', jsonb_build_array('generic-unrelated', 'generic-identical'))); " ++
             "INSERT INTO {s}.working_memory (user_id, session_id, slot_id, slot_type, content, source_key, importance, pinned) " ++
@@ -1190,6 +1191,8 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
             user_a,
             first.memoryKey(),
             user_a,
+            user_a,
+            first.memoryKey(),
             user_a,
             first.memoryKey(),
             user_a,
@@ -1336,7 +1339,7 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const erased = try mgr.eraseMeetingMemories(erase_request);
     try std.testing.expectEqual(1 + cardinality_targets, erased.manifest.counts.memory_source_links_deleted);
     try std.testing.expectEqual(1 + cardinality_targets, erased.manifest.counts.memories_deleted);
-    try std.testing.expectEqual(7 + cardinality_targets, erased.manifest.counts.memory_events_deleted);
+    try std.testing.expectEqual(8 + cardinality_targets, erased.manifest.counts.memory_events_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_embeddings_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_vectors_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_entities_deleted);
@@ -1398,7 +1401,8 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
             "IF EXISTS (SELECT 1 FROM {s}.memory_events WHERE user_id = {d} " ++
             "AND id IN ('wp15-meeting-graph-event', 'wp15-meeting-timeline-event', " ++
             "'wp15-meeting-nested-value-event', 'wp15-meeting-nested-property-event', " ++
-            "'wp15-meeting-embedded-string-event', 'wp15-meeting-memory-id-event')) " ++
+            "'wp15-meeting-embedded-string-event', 'wp15-meeting-embedded-property-event', " ++
+            "'wp15-meeting-memory-id-event')) " ++
             "THEN RAISE EXCEPTION 'meeting traversal carrier survived'; END IF; " ++
             "IF NOT EXISTS (SELECT 1 FROM {s}.memory_events WHERE user_id = {d} " ++
             "AND id IN ('wp15-unrelated-traversal-event', 'wp15-unrelated-nested-event') " ++
