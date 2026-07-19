@@ -319,15 +319,17 @@ const AUDIT_ONLY_PREDICATES = [_][]const u8{
 };
 
 inline fn isRejectedPredicate(predicate: []const u8) bool {
+    const normalized = std.mem.trim(u8, predicate, &std.ascii.whitespace);
     for (REJECTED_PREDICATES) |p| {
-        if (std.mem.eql(u8, p, predicate)) return true;
+        if (std.ascii.eqlIgnoreCase(p, normalized)) return true;
     }
     return false;
 }
 
 inline fn isAuditOnlyPredicate(predicate: []const u8) bool {
+    const normalized = std.mem.trim(u8, predicate, &std.ascii.whitespace);
     for (AUDIT_ONLY_PREDICATES) |p| {
-        if (std.mem.eql(u8, p, predicate)) return true;
+        if (std.ascii.eqlIgnoreCase(p, normalized)) return true;
     }
     return false;
 }
@@ -2321,12 +2323,14 @@ test "parseExtractedJson skips text shorter than 3 chars" {
 
 test "predicate policy separates rejected meta-narrative from audit-only sentinels" {
     try std.testing.expect(isRejectedPredicate("GREETED"));
+    try std.testing.expect(isRejectedPredicate(" greeted\t"));
     try std.testing.expect(isRejectedPredicate("SAID"));
     try std.testing.expect(isRejectedPredicate("ACKNOWLEDGED"));
     try std.testing.expect(!isRejectedPredicate("NO_CONNECTION_FOUND"));
     try std.testing.expect(!isRejectedPredicate("DESCRIPTION"));
     try std.testing.expect(isAuditOnlyPredicate("NO_CONNECTION_FOUND"));
     try std.testing.expect(isAuditOnlyPredicate("DESCRIPTION"));
+    try std.testing.expect(isAuditOnlyPredicate(" description "));
     try std.testing.expect(!isAuditOnlyPredicate("GREETED"));
     try std.testing.expect(!isRejectedPredicate("PREFERS"));
     try std.testing.expect(!isRejectedPredicate("DEPLOYS_TO"));
