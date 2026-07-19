@@ -1167,6 +1167,7 @@ pub const Config = struct {
         MissingPostgresConnectionString,
         InvalidPostgresConnectionString,
         UnsafeZakiBotSandboxConfiguration,
+        UnacknowledgedFullAutonomy,
     };
 
     pub fn validate(self: *const Config) ValidationError!void {
@@ -1238,6 +1239,9 @@ pub const Config = struct {
             {
                 return ValidationError.UnsafeZakiBotSandboxConfiguration;
             }
+            if (self.autonomy.level == .full and !self.autonomy.full_acknowledged) {
+                return ValidationError.UnacknowledgedFullAutonomy;
+            }
         }
     }
 
@@ -1300,6 +1304,10 @@ pub const Config = struct {
             ),
             ValidationError.UnsafeZakiBotSandboxConfiguration => std.debug.print(
                 "Config error: zaki_bot profile requires security.sandbox.enabled=true and fail_open_on_dev=false.\n",
+                .{},
+            ),
+            ValidationError.UnacknowledgedFullAutonomy => std.debug.print(
+                "Config error: zaki_bot profile requires autonomy.full_acknowledged=true when autonomy.level=full.\n",
                 .{},
             ),
         }
@@ -4686,6 +4694,50 @@ test "WP-SEC1: zaki_bot validation rejects disabled or fail-open sandbox" {
 
     cfg.security.sandbox.fail_open_on_dev = false;
     try cfg.validate();
+}
+
+test "WP-SEC1: zaki_bot full autonomy requires operator acknowledgement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .profile = "zaki_bot",
+        .default_provider = "together-ai",
+        .default_model = "moonshotai/Kimi-K2.6",
+    };
+    cfg.providers = &.{
+        .{ .name = "together-ai", .api_key = "together-valid-key", .base_url = "https://api.together.xyz/v1" },
+    };
+    cfg.state.backend = "postgres";
+    cfg.applySecretRuntimeOverrides(
+        try allocator.dupe(u8, "prod-internal-token-1234"),
+        try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki"),
+    );
+    cfg.security.sandbox.enabled = true;
+    cfg.autonomy.level = .full;
+
+    try std.testing.expectError(Config.ValidationError.UnacknowledgedFullAutonomy, cfg.validate());
+
+    cfg.autonomy.full_acknowledged = true;
+    try cfg.validate();
+}
+
+test "WP-SEC1: parser reads full autonomy acknowledgement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(
+        \\{"autonomy":{"level":"full","full_acknowledged":true}}
+    );
+
+    try std.testing.expectEqual(AutonomyLevel.full, cfg.autonomy.level);
+    try std.testing.expect(cfg.autonomy.full_acknowledged);
 }
 
 test "zaki_bot validation rejects missing provider config" {

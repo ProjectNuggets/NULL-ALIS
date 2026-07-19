@@ -776,6 +776,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                 }
             }
+            if (aut.object.get("full_acknowledged")) |v| {
+                if (v == .bool) self.autonomy.full_acknowledged = v.bool;
+            }
             if (aut.object.get("allowed_commands")) |v| {
                 if (v == .array) self.autonomy.allowed_commands = try parseStringArray(self.allocator, v.array);
             }

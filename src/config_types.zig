@@ -81,6 +81,10 @@ pub const AutonomyConfig = struct {
     /// or paid side effects still require confirmation. Users may explicitly
     /// opt into `.full` through the product settings surface.
     level: AutonomyLevel = .supervised,
+    /// Explicit operator acknowledgement for production base configs that
+    /// select `.full`. Tenant settings carry their own informed-choice marker;
+    /// this closes the remaining direct config.json path.
+    full_acknowledged: bool = false,
     workspace_only: bool = true,
     /// 2026-05-24 (v1.14.20): metering moved to zaki-prod central meter
     /// (5-hour rolling + weekly windows aggregated across products). Runtime-
