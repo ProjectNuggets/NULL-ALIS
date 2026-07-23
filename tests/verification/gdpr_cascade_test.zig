@@ -15,6 +15,7 @@ const std = @import("std");
 const nullalis = @import("nullalis");
 const migrations = nullalis.migrations;
 const memory_root = nullalis.memory;
+const gdpr = nullalis.gdpr;
 const harness = @import("harness.zig");
 
 /// True iff `line` declares a `user_id` column with an FK to
@@ -265,4 +266,72 @@ test "S6.11 D25 live: DELETE FROM users cascades EVERY publicly-seedable table" 
         std.debug.print("S6.11 D25 live: trace_shares survived user delete — cascade broken\n", .{});
         return error.TraceShareSurvivedUserDelete;
     }
+}
+
+test "S6.11 P1 live: purgeUser orchestrator erases the user + markdown projection with a clean manifest" {
+    // The live cascade test above covers `mgr.deleteUser`. This covers the
+    // ORCHESTRATOR the HTTP route (DELETE /api/v1/users/:id/data) actually calls
+    // — `gdpr.purgeUser` — which does the pg cascade PLUS the filesystem
+    // projection removal PLUS the complete-or-loud manifest. Before this, the
+    // shipped erasure surface had only unit tests of its auth/confirm/method
+    // REJECTION paths; nothing exercised a real purge end to end.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const test_url = try harness.requirePostgresUrl(allocator);
+
+    var prov = try harness.provisionTestUser(allocator, test_url, "p1_purge", "/tmp/nullalis-p1-provision");
+    defer harness.dropAndDeinit(&prov.mgr, "p1_purge");
+    const uid = prov.uid;
+    const mgr = &prov.mgr;
+
+    // Seed a durable memory row (a pg-cascade surface).
+    try mgr.upsertMemory(uid, "p1-memory-key", "erase me via the orchestrator", .core, null);
+    const mem_before = try mgr.getMemory(allocator, uid, "p1-memory-key");
+    if (mem_before) |m| m.deinit(allocator);
+    try std.testing.expect(mem_before != null);
+
+    // Seed the markdown projection at {users_root}/{uid}/workspace/note.md — the
+    // surface the raw-cascade test does NOT cover. purgeUser must deleteTree it.
+    const users_root = "/tmp/nullalis-p1-purge-root";
+    var dir_buf: [512]u8 = undefined;
+    const user_root_dir = try std.fmt.bufPrint(&dir_buf, "{s}/{d}", .{ users_root, uid });
+    std.fs.cwd().deleteTree(user_root_dir) catch {}; // clear any prior-run residue
+    var ws_buf: [512]u8 = undefined;
+    const ws_dir = try std.fmt.bufPrint(&ws_buf, "{s}/workspace", .{user_root_dir});
+    try std.fs.cwd().makePath(ws_dir);
+    {
+        var note_buf: [512]u8 = undefined;
+        const note_path = try std.fmt.bufPrint(&note_buf, "{s}/note.md", .{ws_dir});
+        var f = try std.fs.cwd().createFile(note_path, .{});
+        defer f.close();
+        try f.writeAll("# projected workspace\nerase me too\n");
+    }
+    try std.fs.cwd().access(user_root_dir, .{}); // pre-condition: projection exists
+
+    // Run the orchestrator exactly as the DELETE route does.
+    var report = try gdpr.purgeUser(.{
+        .allocator = allocator,
+        .zaki_state = mgr,
+        .users_root = users_root,
+    }, uid);
+    defer report.deinit(allocator);
+
+    // Manifest: complete-or-loud — every attempted surface succeeded.
+    try std.testing.expect(report.errors.items.len == 0);
+    try std.testing.expect(report.fullySucceeded());
+    try std.testing.expect(report.pg_user_row_deleted);
+    try std.testing.expect(report.filesystem_removed);
+
+    // Residue: the pg memory row is gone (cascade) ...
+    const mem_after = try mgr.getMemory(allocator, uid, "p1-memory-key");
+    if (mem_after) |m| m.deinit(allocator);
+    try std.testing.expect(mem_after == null);
+
+    // ... and the markdown projection is gone (filesystem step).
+    const dir_gone = blk: {
+        std.fs.cwd().access(user_root_dir, .{}) catch break :blk true;
+        break :blk false;
+    };
+    try std.testing.expect(dir_gone);
 }
