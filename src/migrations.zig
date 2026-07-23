@@ -1116,3 +1116,117 @@ test "S10.4 — initial schema declares cross-schema FK to public.zaki_users wit
     try std.testing.expect(std.mem.indexOf(u8, sql, "DO $$") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "WHERE conname = 'users_user_id_fkey'") != null);
 }
+
+// ── Migration file-coverage guard (P0, owner ruling 2026-07-23) ──────────
+//
+// Catches the class "a `src/migrations/*.sql` file exists on disk but is not
+// registered in MIGRATIONS": such a file ships in the tree, never runs in
+// production, and CI stays green. (The reverse — a registered entry whose file
+// is missing — is already a compile error via `@embedFile`.) Every migration
+// file must be EITHER registered in MIGRATIONS or listed in PARKED_MIGRATIONS
+// with a reason. A parked migration is a deliberate, documented deferral — it
+// does NOT run in production — not an accidental omission.
+
+const ParkedMigration = struct { name: []const u8, reason: []const u8 };
+
+/// Migration SQL files deliberately NOT registered in MIGRATIONS. A parked
+/// migration never runs in production. Each entry MUST carry a reason.
+/// Registering a parked file (or deleting it) fails the coverage tests below
+/// until this list is updated to match — that is the point of the guard.
+const PARKED_MIGRATIONS = [_]ParkedMigration{
+    .{
+        .name = "0011_meeting_memory_provenance",
+        .reason = "Meeting durable-ingest into the Brain is not activated for launch " ++
+            "(owner ruling 2026-07-23: Minutes stays read-only via the minutes_read tool, so " ++
+            "nothing meeting-specific is persisted and no meeting-scoped erasure is required). " ++
+            "Stays merged-inert until durable meeting memory is chosen. " ++
+            "See docs/engine-owner-intel-2026-07-23.md section 4.",
+    },
+    .{
+        .name = "0012_meeting_memory_erasure_indexes",
+        .reason = "Paired with 0011 (parked). Independently, registering it as .expand trips " ++
+            "the expand-SQL validator (validateExpandSqlWithPolicy rejects DROP INDEX), so it " ++
+            "cannot be registered without a validator amendment. Parked until meeting " ++
+            "durable-ingest is activated.",
+    },
+};
+
+fn migrationIsRegistered(name: []const u8) bool {
+    for (MIGRATIONS) |m| {
+        if (std.mem.eql(u8, m.name, name)) return true;
+    }
+    return false;
+}
+
+fn migrationIsParked(name: []const u8) bool {
+    for (PARKED_MIGRATIONS) |p| {
+        if (std.mem.eql(u8, p.name, name)) return true;
+    }
+    return false;
+}
+
+/// True when the current working directory is the repo root. The coverage
+/// tests read `src/migrations/` relative to cwd; run from elsewhere they skip
+/// rather than false-fail. Mirrors the verification harness's repo-root guard.
+fn cwdIsRepoRoot() bool {
+    std.fs.cwd().access("src/migrations", .{}) catch return false;
+    std.fs.cwd().access("build.zig", .{}) catch return false;
+    return true;
+}
+
+test "every migration SQL file is registered in MIGRATIONS or explicitly parked" {
+    if (!cwdIsRepoRoot()) return error.SkipZigTest;
+    var dir = try std.fs.cwd().openDir("src/migrations", .{ .iterate = true });
+    defer dir.close();
+
+    var found_any = false;
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".sql")) continue;
+        found_any = true;
+        const name = entry.name[0 .. entry.name.len - ".sql".len];
+        if (migrationIsRegistered(name) or migrationIsParked(name)) continue;
+        std.debug.print(
+            "\nmigration file '{s}.sql' is on disk but NOT registered in MIGRATIONS and NOT " ++
+                "in PARKED_MIGRATIONS. Register it in MIGRATIONS, or park it with a reason.\n",
+            .{name},
+        );
+        return error.UnregisteredMigrationFile;
+    }
+    // A green run that scanned zero files would be a false pass (e.g. a wrong
+    // cwd slipping past the guard). Require that we actually saw migrations.
+    try std.testing.expect(found_any);
+}
+
+test "every PARKED migration file still exists on disk" {
+    if (!cwdIsRepoRoot()) return error.SkipZigTest;
+    var dir = try std.fs.cwd().openDir("src/migrations", .{ .iterate = true });
+    defer dir.close();
+
+    for (PARKED_MIGRATIONS) |p| {
+        var name_buf: [256]u8 = undefined;
+        const fname = std.fmt.bufPrint(&name_buf, "{s}.sql", .{p.name}) catch return error.TestNameTooLong;
+        dir.access(fname, .{}) catch {
+            std.debug.print(
+                "\nPARKED_MIGRATIONS lists '{s}' but src/migrations/{s} does not exist. " ++
+                    "Remove the stale park entry.\n",
+                .{ p.name, fname },
+            );
+            return error.StaleParkEntry;
+        };
+    }
+}
+
+test "no migration is both registered and parked" {
+    for (PARKED_MIGRATIONS) |p| {
+        if (migrationIsRegistered(p.name)) {
+            std.debug.print(
+                "\n'{s}' is in both MIGRATIONS and PARKED_MIGRATIONS. A registered migration " ++
+                    "is not parked — remove it from PARKED_MIGRATIONS.\n",
+                .{p.name},
+            );
+            return error.MigrationRegisteredAndParked;
+        }
+    }
+}
