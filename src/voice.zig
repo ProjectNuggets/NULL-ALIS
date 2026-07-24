@@ -261,9 +261,52 @@ fn copyTelegramBotTokenForStt(allocator: std.mem.Allocator, bot_token: []const u
     return allocator.dupe(u8, bot_token);
 }
 
+pub const TranscriptionFormat = enum {
+    webm,
+    m4a,
+    ogg,
+    wav,
+
+    pub fn fromInput(input: []const u8) TranscriptionFormat {
+        if (std.ascii.eqlIgnoreCase(input, "webm")) return .webm;
+        if (std.ascii.eqlIgnoreCase(input, "m4a")) return .m4a;
+        if (std.ascii.eqlIgnoreCase(input, "wav")) return .wav;
+        if (std.ascii.eqlIgnoreCase(input, "ogg")) return .ogg;
+        return .ogg;
+    }
+
+    pub fn extension(self: TranscriptionFormat) []const u8 {
+        return switch (self) {
+            .webm => "webm",
+            .m4a => "m4a",
+            .ogg => "ogg",
+            .wav => "wav",
+        };
+    }
+
+    fn multipartFilename(self: TranscriptionFormat) []const u8 {
+        return switch (self) {
+            .webm => "audio.webm",
+            .m4a => "audio.m4a",
+            .ogg => "audio.ogg",
+            .wav => "audio.wav",
+        };
+    }
+
+    fn contentType(self: TranscriptionFormat) []const u8 {
+        return switch (self) {
+            .webm => "audio/webm",
+            .m4a => "audio/mp4",
+            .ogg => "audio/ogg",
+            .wav => "audio/wav",
+        };
+    }
+};
+
 pub const TranscribeOptions = struct {
     model: []const u8 = "whisper-large-v3",
     language: ?[]const u8 = null,
+    format: TranscriptionFormat = .ogg,
 };
 
 pub const SynthesizeOptions = struct {
@@ -598,7 +641,11 @@ fn buildMultipartBody(
     // Part: file
     try body.appendSlice(allocator, "--");
     try body.appendSlice(allocator, boundary);
-    try body.appendSlice(allocator, "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.ogg\"\r\nContent-Type: audio/ogg\r\n\r\n");
+    try body.appendSlice(allocator, "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"");
+    try body.appendSlice(allocator, opts.format.multipartFilename());
+    try body.appendSlice(allocator, "\"\r\nContent-Type: ");
+    try body.appendSlice(allocator, opts.format.contentType());
+    try body.appendSlice(allocator, "\r\n\r\n");
     try body.appendSlice(allocator, file_data);
     try body.appendSlice(allocator, "\r\n");
 
@@ -641,7 +688,11 @@ fn writeMultipartToTempFile(
     // Write file part header
     try tmp_file.writeAll("--");
     try tmp_file.writeAll(boundary);
-    try tmp_file.writeAll("\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.ogg\"\r\nContent-Type: audio/ogg\r\n\r\n");
+    try tmp_file.writeAll("\r\nContent-Disposition: form-data; name=\"file\"; filename=\"");
+    try tmp_file.writeAll(opts.format.multipartFilename());
+    try tmp_file.writeAll("\"\r\nContent-Type: ");
+    try tmp_file.writeAll(opts.format.contentType());
+    try tmp_file.writeAll("\r\n\r\n");
 
     // Stream audio file directly (no intermediate buffer)
     {
@@ -1011,15 +1062,42 @@ test "voice TranscribeOptions defaults" {
     const opts = TranscribeOptions{};
     try std.testing.expectEqualStrings("whisper-large-v3", opts.model);
     try std.testing.expect(opts.language == null);
+    try std.testing.expectEqual(TranscriptionFormat.ogg, opts.format);
 }
 
 test "voice TranscribeOptions custom" {
     const opts = TranscribeOptions{
         .model = "whisper-large-v3-turbo",
         .language = "ru",
+        .format = .webm,
     };
     try std.testing.expectEqualStrings("whisper-large-v3-turbo", opts.model);
     try std.testing.expectEqualStrings("ru", opts.language.?);
+    try std.testing.expectEqual(TranscriptionFormat.webm, opts.format);
+}
+
+test "voice TranscriptionFormat closes unsafe path inputs" {
+    const cases = [_]struct {
+        input: []const u8,
+        expected: TranscriptionFormat,
+        extension: []const u8,
+    }{
+        .{ .input = "webm", .expected = .webm, .extension = "webm" },
+        .{ .input = "M4A", .expected = .m4a, .extension = "m4a" },
+        .{ .input = "ogg", .expected = .ogg, .extension = "ogg" },
+        .{ .input = "wav", .expected = .wav, .extension = "wav" },
+        .{ .input = "../../escape", .expected = .ogg, .extension = "ogg" },
+        .{ .input = "webm\r\nX-Injected: true", .expected = .ogg, .extension = "ogg" },
+        .{ .input = "unknown", .expected = .ogg, .extension = "ogg" },
+    };
+
+    for (cases) |case| {
+        const format = TranscriptionFormat.fromInput(case.input);
+        try std.testing.expectEqual(case.expected, format);
+        try std.testing.expectEqualStrings(case.extension, format.extension());
+        try std.testing.expect(std.mem.indexOfAny(u8, format.extension(), "/\\\r\n") == null);
+        try std.testing.expect(std.mem.indexOfAny(u8, format.multipartFilename(), "/\\\r\n") == null);
+    }
 }
 
 test "voice generateBoundary produces 32 hex chars" {
@@ -1057,6 +1135,71 @@ test "voice buildMultipartBody structure" {
     try std.testing.expect(std.mem.indexOf(u8, body, "whisper-large-v3") != null);
     // Check closing boundary
     try std.testing.expect(std.mem.indexOf(u8, body, "--abcdef0123456789abcdef0123456789--") != null);
+}
+
+test "voice multipart bodies preserve browser audio format metadata" {
+    const allocator = std.testing.allocator;
+    const boundary = "abcdef0123456789abcdef0123456789";
+    const cases = [_]struct {
+        format: TranscriptionFormat,
+        filename: []const u8,
+        content_type: []const u8,
+    }{
+        .{ .format = .webm, .filename = "filename=\"audio.webm\"", .content_type = "Content-Type: audio/webm" },
+        .{ .format = .m4a, .filename = "filename=\"audio.m4a\"", .content_type = "Content-Type: audio/mp4" },
+        .{ .format = .ogg, .filename = "filename=\"audio.ogg\"", .content_type = "Content-Type: audio/ogg" },
+        .{ .format = .wav, .filename = "filename=\"audio.wav\"", .content_type = "Content-Type: audio/wav" },
+    };
+
+    for (cases) |case| {
+        const body = try buildMultipartBody(allocator, boundary, "audio bytes", .{ .format = case.format });
+        defer allocator.free(body);
+
+        try std.testing.expect(std.mem.indexOf(u8, body, case.filename) != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, case.content_type) != null);
+    }
+
+    const fallback_body = try buildMultipartBody(
+        allocator,
+        boundary,
+        "audio bytes",
+        .{ .format = TranscriptionFormat.fromInput("webm\"\r\nX-Injected: true") },
+    );
+    defer allocator.free(fallback_body);
+    try std.testing.expect(std.mem.indexOf(u8, fallback_body, "filename=\"audio.ogg\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fallback_body, "Content-Type: audio/ogg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fallback_body, "X-Injected") == null);
+}
+
+test "voice streamed multipart preserves browser audio format metadata" {
+    const allocator = std.testing.allocator;
+    const boundary = "abcdef0123456789abcdef0123456789";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const audio_file = try tmp.dir.createFile("audio.bin", .{});
+        defer audio_file.close();
+        try audio_file.writeAll("audio bytes");
+    }
+
+    const audio_path = try tmp.dir.realpathAlloc(allocator, "audio.bin");
+    defer allocator.free(audio_path);
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const multipart_path = try std.fmt.allocPrint(allocator, "{s}/multipart.bin", .{tmp_root});
+    defer allocator.free(multipart_path);
+    const multipart_path_z = try allocator.dupeZ(u8, multipart_path);
+    defer allocator.free(multipart_path_z);
+
+    try writeMultipartToTempFile(multipart_path_z, audio_path, boundary, .{ .format = .m4a });
+    const body_file = try std.fs.openFileAbsolute(multipart_path, .{});
+    defer body_file.close();
+    const body = try body_file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "filename=\"audio.m4a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Content-Type: audio/mp4") != null);
 }
 
 test "voice buildMultipartBody with language" {
