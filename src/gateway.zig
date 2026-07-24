@@ -11463,7 +11463,7 @@ fn handleApiChatStreamSseConnection(
                 sendSseErrorResponse(stream, req_allocator, "503 Service Unavailable", "voice_key_missing", "voice api key not configured");
                 return true;
             };
-            const audio_format = jsonStringField(body, "format") orelse "webm";
+            const audio_format = voice.TranscriptionFormat.fromInput(jsonStringField(body, "format") orelse "webm");
             const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(audio_b64) catch {
                 sendSseErrorResponse(stream, req_allocator, "400 Bad Request", "invalid_base64", "invalid base64");
                 return true;
@@ -11482,7 +11482,7 @@ fn handleApiChatStreamSseConnection(
             std.crypto.random.bytes(&rand_bytes);
             const rand_suffix: u32 = std.mem.readInt(u32, &rand_bytes, .little);
             var path_buf: [256]u8 = undefined;
-            const tmp_path = std.fmt.bufPrint(&path_buf, "/tmp/nullalis_chat_stt_{d}_{x}.{s}", .{ ts, rand_suffix, audio_format }) catch {
+            const tmp_path = std.fmt.bufPrint(&path_buf, "/tmp/nullalis_chat_stt_{d}_{x}.{s}", .{ ts, rand_suffix, audio_format.extension() }) catch {
                 sendSseErrorResponse(stream, req_allocator, "500 Internal Server Error", "path_build_failed", "path build failed");
                 return true;
             };
@@ -11507,6 +11507,7 @@ fn handleApiChatStreamSseConnection(
             const transcript = voice.transcribeFile(req_allocator, stt_key, endpoint, tmp_path, .{
                 .model = cfg.audio_media.model,
                 .language = cfg.audio_media.language,
+                .format = audio_format,
             }) catch {
                 sendSseErrorResponse(stream, req_allocator, "502 Bad Gateway", "transcription_failed", "transcription failed");
                 return true;
@@ -22575,7 +22576,7 @@ fn handleVoiceTranscribe(
         return .{ .status = "413 Payload Too Large", .body = "{\"error\":\"audio too large\"}" };
     }
 
-    const format = jsonStringField(body, "format") orelse "webm";
+    const format = voice.TranscriptionFormat.fromInput(jsonStringField(body, "format") orelse "webm");
 
     // Decode base64 → raw audio bytes
     const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(audio_b64) catch {
@@ -22595,7 +22596,7 @@ fn handleVoiceTranscribe(
     std.crypto.random.bytes(&rand_bytes);
     const rand_suffix: u32 = std.mem.readInt(u32, &rand_bytes, .little);
     var path_buf: [256]u8 = undefined;
-    const tmp_path = std.fmt.bufPrint(&path_buf, "/tmp/nullalis_stt_{d}_{x}.{s}", .{ ts, rand_suffix, format }) catch {
+    const tmp_path = std.fmt.bufPrint(&path_buf, "/tmp/nullalis_stt_{d}_{x}.{s}", .{ ts, rand_suffix, format.extension() }) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"path build failed\"}" };
     };
     var z_buf: [257]u8 = undefined;
@@ -22618,6 +22619,7 @@ fn handleVoiceTranscribe(
     const text = voice.transcribeFile(allocator, api_key, endpoint, tmp_path, .{
         .model = cfg.audio_media.model,
         .language = cfg.audio_media.language,
+        .format = format,
     }) catch {
         return .{ .status = "502 Bad Gateway", .body = "{\"error\":\"transcription failed\"}" };
     };
